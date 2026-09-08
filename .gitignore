@@ -2,3 +2,4 @@ zig-out/
 .zig-cache/
 build/
 BOOTX64.EFI
+build.zig.zon

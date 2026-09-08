@@ -39,7 +39,16 @@ pub fn build(b: *std.Build) void {
 
     // Run
 
+    const mkdir = b.addSystemCommand(&.{
+        "mkdir",
+        "-p",
+        "build/disk/EFI/BOOT",
+    });
+
+    mkdir.step.dependOn(&install_step.step);
+
     const cp_cmd = b.addSystemCommand(&.{ "cp", "zig-out/bin/BOOTX64.efi", "build/disk/EFI/BOOT/BOOTX64.EFI" });
+    cp_cmd.step.dependOn(&mkdir.step);
     cp_cmd.step.dependOn(&install_step.step);
 
     const run_cmd = b.addSystemCommand(&.{ "qemu-system-x86_64", "-serial", "stdio", "-bios", "/usr/share/edk2-ovmf/x64/OVMF.4m.fd", "-drive", "format=raw,file=fat:rw:build/disk", "-display", "gtk" });
