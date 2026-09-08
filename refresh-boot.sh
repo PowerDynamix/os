@@ -1,1 +1,0 @@
-cp zig-out/bin/BOOTX64.efi build/disk/EFI/BOOT/BOOTX64.EFI
