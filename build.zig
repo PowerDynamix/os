@@ -3,8 +3,14 @@ const std = @import("std");
 const TestCase = struct {
     name: []const u8,
     source: []const u8,
+    scenario: []const u8 = "",
 };
 const tests = [_]TestCase{
+    .{ .name = "apic-keyboard", .source = "src/tests/hardware.zig" },
+    .{ .name = "idt-layout", .source = "src/tests/idt.zig", .scenario = "layout" },
+    .{ .name = "breakpoint", .source = "src/tests/idt.zig", .scenario = "breakpoint" },
+    .{ .name = "double-fault", .source = "src/tests/idt.zig", .scenario = "double-fault" },
+    .{ .name = "double-fault-stack", .source = "src/tests/idt.zig", .scenario = "bad-stack" },
     .{
         .name = "basic-boot",
         .source = "src/tests/basic_boot.zig",
@@ -36,6 +42,8 @@ pub fn build(b: *std.Build) void {
     kernel.subsystem = .efi_application;
 
     const install_step = b.addInstallArtifact(kernel, .{ .dest_dir = .{ .override = .bin } });
+
+    b.getInstallStep().dependOn(&install_step.step);
 
     // Run
 
@@ -93,6 +101,9 @@ fn addQemuTest(
     });
 
     test_efi.subsystem = .efi_application;
+    const options = b.addOptions();
+    options.addOption([]const u8, "scenario", t.scenario);
+    test_efi.root_module.addOptions("test_options", options);
 
     test_efi.root_module.addImport("os_kernel", b.createModule(.{
         .root_source_file = b.path("./src/root.zig"),
@@ -128,7 +139,10 @@ fn addQemuTest(
     );
 
     const qemu = b.addSystemCommand(&.{
+        "timeout",
+        "30s",
         "qemu-system-x86_64",
+        "-no-reboot",
         "-serial",
         b.fmt("file:{s}", .{serial_log}),
         "-bios",
@@ -145,6 +159,7 @@ fn addQemuTest(
     });
 
     qemu.expectExitCode(33);
+    qemu.has_side_effects = true;
 
     qemu.step.dependOn(&install_step.step);
     qemu.step.dependOn(&copy.step);

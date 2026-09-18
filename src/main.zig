@@ -5,6 +5,10 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 const fb = @import("framebuffer.zig");
 const cs = @import("console.zig");
 const fnt = @import("font.zig");
+const interrupts = @import("interrputs.zig");
+const acpi = @import("acpi.zig");
+const apic = @import("apic.zig");
+const keyboard = @import("keyboard.zig");
 
 const font_data = @embedFile("assets/fonts/ter-u16n.psf");
 
@@ -97,9 +101,13 @@ pub fn main() uefi.Status {
 
         return uefi_panic(con_out, "Failed to load console font.");
     };
-    var console = cs.Console.init(&framebuffer, console_font);
+    cs.k_console = cs.Console.init(&framebuffer, console_font);
 
-    console.clear();
+    cs.k_console.clear();
+    const topology = acpi.discover() catch |err| {
+        cs.k_console.panic("ACPI discovery failed: {s}", .{@errorName(err)});
+    };
+    const framebuffer_addr = gop.mode.frame_buffer_base;
 
     // -------------------------------------------------------------------------
     // Retrieve the UEFI memory map
@@ -130,23 +138,40 @@ pub fn main() uefi.Status {
         return uefi_panic(con_out, "Failed to exit UEFI Boot Services.");
     };
 
+    // Install exception gates before taking ownership of hardware interrupts.
+    interrupts.init_gdt();
+    interrupts.init_idt();
+    apic.init(topology) catch |err| {
+        cs.k_console.panic("APIC initialization failed: {s}", .{@errorName(err)});
+    };
+    keyboard.init() catch |err| {
+        cs.k_console.panic("PS/2 keyboard initialization failed: {s}", .{@errorName(err)});
+    };
+
     // -------------------------------------------------------------------------
-    // Print stuff and stop execution
+    // Display boot information, then consume keyboard input.
     // -------------------------------------------------------------------------
 
     // You can now seamlessly format numbers, strings, pointers, and types!
-    console.print("Welcome to the OS!\n", .{});
-    console.print("-----------------------------\n", .{});
+    cs.k_console.print("Welcome to the OS!\n", .{});
+    cs.k_console.print("-----------------------------\n", .{});
 
     const mem_amount: u32 = 4096;
-    console.print("System Memory Verified: {} MB\n", .{mem_amount});
+    cs.k_console.print("System Memory Verified: {} MB\n", .{mem_amount});
 
-    const framebuffer_addr: usize = gop.mode.frame_buffer_base;
-    console.print("GOP Framebuffer Base:   0x{X}\n", .{framebuffer_addr});
+    cs.k_console.print("GOP Framebuffer Base:   0x{X}\n", .{framebuffer_addr});
 
-    //console.panic("No filesystem found", .{});
+    cs.k_console.print("APIC ready. Type on the PS/2 keyboard:\n", .{});
 
-    halt();
-
-    return uefi.Status.success;
+    while (true) {
+        interrupts.disable();
+        if (keyboard.pop()) |ch| {
+            interrupts.enable();
+            if (ch >= 32 or ch == '\n' or ch == '\t' or ch == '\x08') {
+                cs.k_console.putChar(ch);
+            }
+        } else {
+            interrupts.wait_for_interrupt();
+        }
+    }
 }

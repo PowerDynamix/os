@@ -6,8 +6,9 @@ const fnt = @import("font.zig");
 ///
 /// This is used when execution cannot safely continue, and after
 /// `ExitBootServices` has been called.
-fn halt() void {
+fn halt() noreturn {
     while (true) {
+        asm volatile ("cli");
         asm volatile ("hlt");
     }
 }
@@ -62,6 +63,15 @@ pub const Console = struct {
     pub fn putChar(self: *Console, c: u8) void {
         // 1. Handle special non-printable control characters
         switch (c) {
+            '\x08' => {
+                // Erase one cell on this line without overwriting previous output.
+                if (self.cursor_x >= self.font.width) {
+                    self.cursor_x -= self.font.width;
+                    self.putChar(' ');
+                    self.cursor_x -= self.font.width;
+                }
+                return;
+            },
             '\n' => {
                 self.newline();
                 return;
@@ -136,22 +146,22 @@ pub const Console = struct {
 
     /// Shifts rows upward by one character height and blanks out the trailing line bottom space
     fn scroll(self: *Console) void {
-        const shift_src_offset = self.font.height * self.fb.height;
-        const total_shifted_pixels = (self.fb.height - self.font.height) * self.fb.height;
+        const shift_src_offset = self.font.height * self.fb.stride;
+        const total_shifted_pixels = (self.fb.height - self.font.height) * self.fb.stride;
 
         // Blit data contents upwards across the primary linear base index
         std.mem.copyForwards(u32, self.fb.base[0..total_shifted_pixels], self.fb.base[shift_src_offset .. shift_src_offset + total_shifted_pixels]);
 
         // Wipe trailing remaining blank buffer pixels below the new content boundary
         const clear_start = total_shifted_pixels;
-        const clear_count = self.font.height * self.fb.width;
+        const clear_count = self.font.height * self.fb.stride;
         @memset(self.fb.base[clear_start .. clear_start + clear_count], self.bg_color);
 
         // Keep y cursor clamped right at the top boundary of the last renderable row block
         self.cursor_y = self.fb.height - self.font.height;
     }
 
-    pub fn panic(self: *Console, comptime fmt: []const u8, args: anytype) void {
+    pub fn panic(self: *Console, comptime fmt: []const u8, args: anytype) noreturn {
         self.print("\n\nKERNEL PANIC!\n", .{});
         self.print("-----------------------------\n", .{});
 
@@ -174,3 +184,5 @@ pub const Console = struct {
         halt();
     }
 };
+
+pub var k_console: Console = undefined;
