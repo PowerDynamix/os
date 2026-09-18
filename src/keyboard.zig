@@ -1,9 +1,10 @@
 //! PS/2 first-port keyboard, translated scan-code set 1, US layout.
-//! IRQs only decode and enqueue bytes; the main loop owns console rendering.
+//! IRQs only decode/enqueue bytes and wake a reader; tasks own console rendering.
 const io = @import("io.zig");
 const apic = @import("apic.zig");
 const irq = @import("interrputs.zig");
 const std = @import("std");
+const task = @import("task.zig");
 
 /// Stateful decoder also exercised independently of hardware by tests.
 pub const Decoder = struct {
@@ -100,6 +101,7 @@ var head: u8 = 0;
 var tail: u8 = 0;
 pub var dropped: u32 = 0;
 pub var interrupt_count: u32 = 0;
+var reader: ?task.Waker = null;
 
 fn enqueue(ch: u8) void {
     const h = @atomicLoad(u8, &head, .monotonic);
@@ -110,6 +112,38 @@ fn enqueue(ch: u8) void {
     }
     queue[h] = ch;
     @atomicStore(u8, &head, next, .release);
+    if (reader) |waker| {
+        waker.wake();
+    }
+}
+
+/// Async single-consumer read: null means suspended until IRQ1 wakes the task.
+/// Checking the queue and subscribing happen with IF clear, so input cannot
+/// arrive between them. Do not mix another pop() consumer with an async reader.
+pub fn pollRead(waker: task.Waker) !?u8 {
+    const enabled = irq.enabled();
+    irq.disable();
+    defer if (enabled) irq.enable();
+    if (!waker.isActive()) return error.InvalidTask;
+    if (reader) |waiting| {
+        if (!waiting.eql(waker) and waiting.isActive()) return error.ReaderBusy;
+    }
+    if (pop()) |ch| {
+        reader = null;
+        return ch;
+    }
+    reader = waker;
+    return null;
+}
+
+/// Detach on task completion/cancellation before its executor storage expires.
+pub fn cancelRead(waker: task.Waker) void {
+    const enabled = irq.enabled();
+    irq.disable();
+    defer if (enabled) irq.enable();
+    if (reader) |waiting| {
+        if (waiting.eql(waker)) reader = null;
+    }
 }
 pub fn pop() ?u8 {
     const t = @atomicLoad(u8, &tail, .monotonic);
@@ -183,6 +217,7 @@ pub fn init() !void {
     tail = 0;
     dropped = 0;
     interrupt_count = 0;
+    reader = null;
     try command(0xad); // Disable first port while clearing firmware input.
     try command(0xa7); // Disable auxiliary port.
     for (0..256) |_| {

@@ -5,3 +5,4 @@ pub const apic = @import("apic.zig");
 pub const keyboard = @import("keyboard.zig");
 pub const io = @import("io.zig");
 pub const memory = @import("memory.zig");
+pub const task = @import("task.zig");

@@ -10,6 +10,8 @@ const acpi = @import("acpi.zig");
 const apic = @import("apic.zig");
 const keyboard = @import("keyboard.zig");
 const memory = @import("memory.zig");
+const task = @import("task.zig");
+const examples = @import("examples/tasks.zig");
 
 const font_data = @embedFile("assets/fonts/ter-u16n.psf");
 
@@ -168,17 +170,18 @@ pub fn main() uefi.Status {
 
     cs.k_console.print("GOP Framebuffer Base:   0x{X}\n", .{framebuffer_addr});
 
-    cs.k_console.print("APIC ready. Type on the PS/2 keyboard:\n", .{});
-
-    while (true) {
-        interrupts.disable();
-        if (keyboard.pop()) |ch| {
-            interrupts.enable();
-            if (ch >= 32 or ch == '\n' or ch == '\t' or ch == '\x08') {
-                cs.k_console.putChar(ch);
-            }
-        } else {
-            interrupts.wait_for_interrupt();
-        }
-    }
+    cs.k_console.print("Starting worker and async keyboard tasks.\n", .{});
+    var executor: task.Executor = .{};
+    var worker: examples.Counter = .{};
+    var input: examples.Keyboard = .{};
+    _ = executor.spawn(&worker, examples.Counter.poll, null) catch |err| {
+        cs.k_console.panic("Worker spawn failed: {s}", .{@errorName(err)});
+    };
+    _ = executor.spawn(&input, examples.Keyboard.poll, examples.Keyboard.cleanup) catch |err| {
+        cs.k_console.panic("Keyboard task spawn failed: {s}", .{@errorName(err)});
+    };
+    executor.run();
+    interrupts.disable();
+    halt();
+    return .success;
 }

@@ -12,11 +12,12 @@ This is a UEFI os kernel written in zig for personal study.
 - Physical frame allocation and kernel-owned four-level paging for new mappings
 - An 8 MiB heap, plus bump, arena, and fixed-object pool allocation
 - Page-fault diagnostics and hardware-tested read-only/non-executable pages
+- Cooperative multitasking with IRQ wakeups and an async keyboard task
 - QEMU integration tests (with serial logger)
 
 ## Exception handling tests
 
-Run `zig build test` to execute all eleven QEMU tests. Individual exception tests:
+Run `zig build test` to execute all twelve QEMU tests. Individual exception tests:
 
 - `zig build test-idt-layout`: loaded IDT/GDT limits, gate addresses and flags, TSS/IST setup, and table reload.
 - `zig build test-breakpoint`: actual `int3` delivery and saved register frame.
@@ -32,7 +33,7 @@ Exception setup installs breakpoint, double-fault, and page-fault gates. APIC in
 
 Run `zig build run`, focus the QEMU window, and type. The kernel reads ACPI's MADT before leaving Boot Services, masks the legacy PIC and unused I/O APIC routes, initializes the boot CPU's xAPIC, and routes keyboard IRQ1 using any ACPI source override. All hardware gates are installed before interrupts are enabled. Handlers preserve general registers and x87/SSE state, acknowledge real interrupts through the local APIC, and return with `iretq`; the spurious vector does not send EOI.
 
-The PS/2 driver sets scan-code set 2 with controller translation to set 1. Its interrupt callback decodes input into a bounded FIFO; console rendering happens in the main loop. The loop checks input with interrupts disabled and uses `sti; hlt` to sleep without losing wakeups. Overflow drops the newest character and increments `keyboard.dropped`. Extended navigation keys are ignored; this is text input, not a shell or a full terminal. USB keyboards, mouse input, SMP, x2APIC, and AVX context switching are not implemented. The current baseline x86_64 build uses x87/SSE; the kernel preserves UEFI's identity mappings and uncacheable APIC MMIO mappings in its new page-table root.
+The PS/2 driver sets scan-code set 2 with controller translation to set 1. Its interrupt callback decodes input into a bounded FIFO; console rendering happens in the keyboard task. The reader checks input and registers its wake handle with interrupts disabled. The executor uses `sti; hlt` when no task is ready, avoiding lost wakeups. Overflow drops the newest character and increments `keyboard.dropped`. Extended navigation keys are ignored; this is text input, not a shell or a full terminal. USB keyboards, mouse input, SMP, x2APIC, and AVX context switching are not implemented. The current baseline x86_64 build uses x87/SSE; the kernel preserves UEFI's identity mappings and uncacheable APIC MMIO mappings in its new page-table root.
 
 `zig build test-apic-keyboard` verifies ACPI overrides and malformed records, scan-code decoding, returning IRQ register/flag preservation, repeated local APIC timer delivery, spurious-interrupt handling, and real IRQ1 delivery using the controller's D2 output-buffer command. It also checks queue overflow/wraparound and end-of-interrupt acknowledgement. Run `zig build test -Doptimize=ReleaseSafe` to exercise the same paths with optimization.
 
@@ -86,3 +87,47 @@ Memory tests:
 - `zig build test-apic-keyboard`: existing interrupt and keyboard integration under the kernel's new page tables.
 
 `zig build test -Doptimize=ReleaseSafe` runs the same suite with optimization.
+
+
+## Cooperative multitasking and async examples
+
+`src/task.zig` provides a single-CPU, stackless executor for up to 32 tasks. Each task has a caller-owned context and a poll function returning `.yield` (schedule another turn), `.pending` (wait for an event to wake it), or `.complete` (release its slot). Ready tasks run round-robin. The executor clears readiness before polling so a wake during the poll is retained, and repeated wakes coalesce. A task generation identifies each slot lifetime; late wakes cannot target a replacement task. Cancelled and completed tasks run their optional cleanup exactly once.
+
+`src/examples/tasks.zig` contains two examples started by `main.zig`:
+
+- `Counter` adds 1 through 5, prints its progress, yields between steps, and completes with a total of 15.
+- `Keyboard` waits for input with `keyboard.pollRead`, echoes one character per poll, and yields while draining buffered input. An empty FIFO suspends it until IRQ1 wakes it. Its cleanup detaches the keyboard subscription.
+
+Run `zig build run` to see the worker output, then type in QEMU to exercise the keyboard task. Both tasks are registered together; the worker can finish while the keyboard task waits for input. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
+
+A minimal execution example, after memory, APIC, and keyboard initialization:
+
+```zig
+const task = @import("task.zig");
+
+const Job = struct {
+    remaining: usize = 3,
+
+    fn poll(context: *anyopaque, _: task.Waker) task.Poll {
+        const self: *Job = @ptrCast(@alignCast(context));
+        // Perform one bounded piece of work here.
+        self.remaining -= 1;
+        return if (self.remaining == 0) .complete else .yield;
+    }
+};
+
+fn executeExample() !void {
+    var executor: task.Executor = .{};
+    var job: Job = .{};
+    _ = try executor.spawn(&job, Job.poll, null);
+    executor.run(); // Returns when all tasks have completed.
+}
+```
+
+Polls run with interrupts enabled. Task state survives in the context across calls; local variables in the poll function do not. Polls must return promptly and must not block or spin waiting for I/O. There is no timer preemption, separate task stack, userspace isolation, or SMP scheduling. A task that never returns prevents other tasks from running. Heap allocation and console printing remain safe between cooperative tasks because IRQ handlers do not use them.
+
+`Executor.step()` polls at most one ready task without sleeping. `Executor.run()` sleeps when only pending tasks remain and returns when there are none left. Both restore the caller's interrupt-enable state. IRQ handlers may call `Waker.wake()`; they must not spawn, cancel, run tasks, or allocate. The idle sequence follows the interrupt-shadow behavior described in the [Intel instruction manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+
+Keep the executor and task contexts at stable addresses. Contexts must live until completion/cancellation; the executor must outlive all retained wake handles. An optional cleanup callback can release heap-owned contexts and detach event subscriptions. Cleanup runs with interrupts disabled and must be short; it must not run the executor. Use `executor.cancel(handle)` to cancel a task; cancellation of the currently polling task is rejected (return `.complete` instead). Do not reset or copy a live executor. There is one outstanding async keyboard reader; competing subscriptions receive `ReaderBusy`. Do not mix a separate `keyboard.pop()` consumer with it.
+
+`zig build test-tasks` checks round-robin execution, completion and cancellation cleanup, pending tasks without busy polling, wake coalescing, waking during a poll, stale handles, slot capacity/reuse, interrupt-state restoration, APIC wake from idle, and real IRQ1 delivery to the async reader. It also verifies reader cancellation and input already buffered before subscription. The aggregate Debug and ReleaseSafe suites include this test.
