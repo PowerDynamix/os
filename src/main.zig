@@ -9,6 +9,7 @@ const interrupts = @import("interrputs.zig");
 const acpi = @import("acpi.zig");
 const apic = @import("apic.zig");
 const keyboard = @import("keyboard.zig");
+const memory = @import("memory.zig");
 
 const font_data = @embedFile("assets/fonts/ter-u16n.psf");
 
@@ -141,6 +142,9 @@ pub fn main() uefi.Status {
     // Install exception gates before taking ownership of hardware interrupts.
     interrupts.init_gdt();
     interrupts.init_idt();
+    memory.init(memory_map) catch |err| {
+        cs.k_console.panic("Memory initialization failed: {s}", .{@errorName(err)});
+    };
     apic.init(topology) catch |err| {
         cs.k_console.panic("APIC initialization failed: {s}", .{@errorName(err)});
     };
@@ -156,8 +160,11 @@ pub fn main() uefi.Status {
     cs.k_console.print("Welcome to the OS!\n", .{});
     cs.k_console.print("-----------------------------\n", .{});
 
-    const mem_amount: u32 = 4096;
-    cs.k_console.print("System Memory Verified: {} MB\n", .{mem_amount});
+    cs.k_console.print("Managed RAM: {} MiB, free frames: {}\n", .{
+        memory.physical.total_count * memory.frames.page_size / (1024 * 1024),
+        memory.physical.free_count,
+    });
+    cs.k_console.print("Kernel heap: {} MiB\n", .{memory.heap_size / (1024 * 1024)});
 
     cs.k_console.print("GOP Framebuffer Base:   0x{X}\n", .{framebuffer_addr});
 

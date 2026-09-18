@@ -72,12 +72,16 @@ fn verify_tables() void {
     check(gdtr.limit == 39, "Wrong GDT limit\n");
     const entries: *const [256]interrupts.IDTEntry = @ptrFromInt(idtr.base);
     for (entries, 0..) |entry, vector| {
-        if (vector == 3 or vector == 8) {
+        if (vector == 3 or vector == 8 or vector == 14) {
             check(entry.kernel_cs == 8 and entry.attributes == 0x8e, "Invalid gate attributes\n");
             check(entry.ist == (if (vector == 8) @as(u8, 1) else 0), "Wrong gate IST\n");
             check(entry.reserved == 0, "Nonzero reserved gate bits\n");
             const address = @as(u64, entry.isr_low) | (@as(u64, entry.isr_mid) << 16) | (@as(u64, entry.isr_high) << 32);
-            const expected = if (vector == 3) @intFromPtr(&interrupts.isr_stub_3) else @intFromPtr(&interrupts.isr_stub_8);
+            const expected = switch (vector) {
+                3 => @intFromPtr(&interrupts.isr_stub_3),
+                8 => @intFromPtr(&interrupts.isr_stub_8),
+                else => @intFromPtr(&interrupts.isr_stub_14),
+            };
             check(address == expected, "Wrong ISR address\n");
         } else {
             check(entry.attributes == 0, "Unexpected present gate\n");
@@ -129,7 +133,7 @@ pub fn main() uefi.Status {
             \\ 1:
             ::: .{ .rax = true, .memory = true });
     } else if (comptime std.mem.eql(u8, scenario, "bad-stack")) {
-        // A push through an unmapped stack causes #PF. Its absent gate faults
+        // A push through an unmapped stack causes #PF. Its unusable stack faults
         // during delivery, escalating to #DF, which must switch to IST1.
         asm volatile (
             \\ xorq %rsp, %rsp

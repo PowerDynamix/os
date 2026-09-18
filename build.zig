@@ -6,6 +6,10 @@ const TestCase = struct {
     scenario: []const u8 = "",
 };
 const tests = [_]TestCase{
+    .{ .name = "memory", .source = "src/tests/memory.zig" },
+    .{ .name = "page-fault", .source = "src/tests/memory.zig", .scenario = "unmapped" },
+    .{ .name = "page-readonly", .source = "src/tests/memory.zig", .scenario = "readonly" },
+    .{ .name = "page-nx", .source = "src/tests/memory.zig", .scenario = "nx" },
     .{ .name = "apic-keyboard", .source = "src/tests/hardware.zig" },
     .{ .name = "idt-layout", .source = "src/tests/idt.zig", .scenario = "layout" },
     .{ .name = "breakpoint", .source = "src/tests/idt.zig", .scenario = "breakpoint" },

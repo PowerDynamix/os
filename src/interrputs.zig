@@ -2,7 +2,7 @@
 //!
 //! After ExitBootServices, initialize the framebuffer console, call init_gdt(),
 //! then init_idt(). The GDT supplies code/data selectors and the TSS; the IDT
-//! routes breakpoints and double faults to fatal handlers. apic.init() installs
+//! routes breakpoints, double faults and page faults to fatal handlers. apic.init() installs
 //! returning hardware gates; device drivers register callbacks before STI.
 //!
 //! Double faults use a dedicated IST stack so delivery can survive a broken
@@ -94,6 +94,7 @@ pub const InterruptFrame = extern struct {
 pub const ExceptionHandlers = struct {
     breakpoint: *const fn (*const InterruptFrame) noreturn = default_breakpoint_handler,
     double_fault: *const fn (*const InterruptFrame, u64) noreturn = default_double_fault_handler,
+    page_fault: *const fn (*const InterruptFrame, u64, usize) noreturn = default_page_fault_handler,
 };
 
 // -----------------------------------------------------------------------------
@@ -214,6 +215,7 @@ pub fn init_idt_with_handlers(exception_handlers: ExceptionHandlers) void {
     // Breakpoints keep the current stack; double faults switch to IST1.
     idt_set_descriptor(3, isr_stub_3, 0x8E, 0);
     idt_set_descriptor(8, isr_stub_8, 0x8E, 1);
+    idt_set_descriptor(14, isr_stub_14, 0x8E, 0);
 
     asm volatile ("lidt (%[idtr])"
         :
@@ -276,6 +278,23 @@ pub export fn isr_stub_8() callconv(.naked) void {
 }
 
 // Exported C-ABI bridges are called by name from the assembly stubs above.
+pub export fn isr_stub_14() callconv(.naked) void {
+    // Capture CR2 before Zig runs; error code and frame match #DF's layout.
+    asm volatile (
+        \\ cld
+        \\ movq %cr2, %r8
+        \\ movq (%rsp), %rdx
+        \\ leaq 8(%rsp), %rcx
+        \\ andq $-16, %rsp
+        \\ subq $32, %rsp
+        \\ callq page_fault_handler
+    );
+}
+
+export fn page_fault_handler(frame: *const InterruptFrame, error_code: u64, address: usize) callconv(.c) noreturn {
+    handlers.page_fault(frame, error_code, address);
+}
+
 export fn breakpoint_handler(frame: *const InterruptFrame) callconv(.c) noreturn {
     handlers.breakpoint(frame);
 }
@@ -292,6 +311,11 @@ fn default_double_fault_handler(frame: *const InterruptFrame, error_code: u64) n
     cs.k_console.print("DOUBLE FAULT!\n", .{});
     cs.k_console.print("Error code: 0x{X}\nRIP: 0x{X}\nRSP: 0x{X}\n", .{ error_code, frame.rip, frame.rsp });
     cs.k_console.panic("Unrecoverable double fault", .{});
+}
+
+fn default_page_fault_handler(frame: *const InterruptFrame, error_code: u64, address: usize) noreturn {
+    cs.k_console.print("PAGE FAULT! Address: 0x{X}\nError: 0x{X}, RIP: 0x{X}\n", .{ address, error_code, frame.rip });
+    cs.k_console.panic("Unrecoverable page fault", .{});
 }
 
 fn default_breakpoint_handler(frame: *const InterruptFrame) noreturn {

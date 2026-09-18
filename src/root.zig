@@ -4,3 +4,4 @@ pub const acpi = @import("acpi.zig");
 pub const apic = @import("apic.zig");
 pub const keyboard = @import("keyboard.zig");
 pub const io = @import("io.zig");
+pub const memory = @import("memory.zig");

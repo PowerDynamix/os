@@ -194,6 +194,7 @@ pub fn main() uefi.Status {
     bs.exitBootServices(uefi.handle, map.info.key) catch |err| failed(err);
     irq.init_gdt();
     irq.init_idt_with_handlers(.{ .breakpoint = fault, .double_fault = doubleFault });
+    kernel.memory.init(map) catch |err| failed(err);
     apic.init(topology) catch |err| failed(err);
     check(!irq.enabled(), "APIC init enabled IRQs too early\n");
     registerTest();
