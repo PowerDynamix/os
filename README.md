@@ -14,11 +14,12 @@ This is a UEFI os kernel written in zig for personal study.
 - Page-fault diagnostics and hardware-tested read-only/non-executable pages
 - Cooperative multitasking with IRQ wakeups and an async keyboard task
 - Calibrated APIC timer, task sleep, and absolute deadlines
+- Interactive shell with line editing and memory/task diagnostics
 - QEMU integration tests (with serial logger)
 
 ## Exception handling tests
 
-Run `zig build test` to execute all thirteen QEMU tests. Individual exception tests:
+Run `zig build test` to execute all fourteen QEMU tests. Individual exception tests:
 
 - `zig build test-idt-layout`: loaded IDT/GDT limits, gate addresses and flags, TSS/IST setup, and table reload.
 - `zig build test-breakpoint`: actual `int3` delivery and saved register frame.
@@ -34,7 +35,7 @@ Exception setup installs breakpoint, double-fault, and page-fault gates. APIC in
 
 Run `zig build run`, focus the QEMU window, and type. The kernel reads ACPI's MADT before leaving Boot Services, masks the legacy PIC and unused I/O APIC routes, initializes the boot CPU's xAPIC, and routes keyboard IRQ1 using any ACPI source override. All hardware gates are installed before interrupts are enabled. Handlers preserve general registers and x87/SSE state, acknowledge real interrupts through the local APIC, and return with `iretq`; the spurious vector does not send EOI.
 
-The PS/2 driver sets scan-code set 2 with controller translation to set 1. Its interrupt callback decodes input into a bounded FIFO; console rendering happens in the keyboard task. The reader checks input and registers its wake handle with interrupts disabled. The executor uses `sti; hlt` when no task is ready, avoiding lost wakeups. Overflow drops the newest character and increments `keyboard.dropped`. Extended navigation keys are ignored; this is text input, not a shell or a full terminal. USB keyboards, mouse input, SMP, x2APIC, and AVX context switching are not implemented. The current baseline x86_64 build uses x87/SSE; the kernel preserves UEFI's identity mappings and uncacheable APIC MMIO mappings in its new page-table root.
+The PS/2 driver sets scan-code set 2 with controller translation to set 1. Its interrupt callback decodes input into a bounded FIFO; console rendering happens in the shell task. The reader checks input and registers its wake handle with interrupts disabled. The executor uses `sti; hlt` when no task is ready, avoiding lost wakeups. Overflow drops the newest character and increments `keyboard.dropped`. The shell consumes decoded text; extended navigation keys are currently ignored. USB keyboards, mouse input, SMP, x2APIC, and AVX context switching are not implemented. The current baseline x86_64 build uses x87/SSE; the kernel preserves UEFI's identity mappings and uncacheable APIC MMIO mappings in its new page-table root.
 
 `zig build test-apic-keyboard` verifies ACPI overrides and malformed records, scan-code decoding, returning IRQ register/flag preservation, repeated local APIC timer delivery, spurious-interrupt handling, and real IRQ1 delivery using the controller's D2 output-buffer command. It also checks queue overflow/wraparound and end-of-interrupt acknowledgement. Run `zig build test -Doptimize=ReleaseSafe` to exercise the same paths with optimization.
 
@@ -94,13 +95,13 @@ Memory tests:
 
 `src/task.zig` provides a single-CPU, stackless executor for up to 32 tasks. Each task has a caller-owned context and a poll function returning `.yield` (schedule another turn), `.pending` (wait for an event to wake it), or `.complete` (release its slot). Ready tasks run round-robin. The executor clears readiness before polling so a wake during the poll is retained, and repeated wakes coalesce. A task generation identifies each slot lifetime; late wakes cannot target a replacement task. Cancelled and completed tasks run their optional cleanup exactly once.
 
-`src/examples/tasks.zig` contains these examples; `main.zig` starts `PeriodicWorker` and `Keyboard`:
+`src/examples/tasks.zig` contains these examples; `main.zig` starts `PeriodicWorker` alongside the shell from `src/shell.zig`:
 
 - `Counter` is the original basic execution example: it adds 1 through 5, yields between steps, and completes with a total of 15.
 - `PeriodicWorker` sleeps between five progress messages, roughly one second apart, then completes.
 - `Keyboard` waits for input with `keyboard.pollRead`, echoes one character per poll, and yields while draining buffered input. An empty FIFO suspends it until IRQ1 wakes it. Its cleanup detaches the keyboard subscription.
 
-Run `zig build run` and type while the periodic worker prints progress. Both tasks are registered together; the keyboard remains responsive while the worker sleeps and stays active after the worker completes. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
+Run `zig build run` and type while the periodic worker prints progress. Both tasks are registered together; the shell remains responsive while the worker sleeps and stays active after the worker completes. Worker output preserves the prompt and partially typed command. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
 
 A minimal execution example, after memory, APIC, and keyboard initialization:
 
@@ -162,6 +163,26 @@ Use `task.sleepUntil(deadline_ms)` for an absolute deadline in the `timer.now()`
 
 Timer IRQs only advance the clock and wake due tasks. They do not poll tasks, allocate, print, or preempt the current task. The executor still halts when no task is runnable; periodic ticks may wake the CPU without making a task runnable. Task execution can occur later than its deadline. This clock counts delivered interrupts: long periods with interrupts masked can lose/coalesce ticks and delay timekeeping. It is not a wall clock or a hard real-time timer, and power states that stop the LAPIC timer are unsupported. Do not use the raw APIC one-shot/stop/calibration APIs or reinitialize the APIC after starting the timer service, since they share its hardware timer and vector.
 
-`zig build test-timer` checks calibration against a separate 50 ms PIT interval, repeated periodic delivery and EOI, deadline rounding and overflow, ordered and equal-deadline sleepers, unrelated wakes, cancellation and slot reuse, immediate deadlines, queue capacity, and keyboard IRQ delivery alongside a periodic worker. All thirteen tests also run with `zig build test -Doptimize=ReleaseSafe`.
+`zig build test-timer` checks calibration against a separate 50 ms PIT interval, repeated periodic delivery and EOI, deadline rounding and overflow, ordered and equal-deadline sleepers, unrelated wakes, cancellation and slot reuse, immediate deadlines, queue capacity, and keyboard IRQ delivery alongside a periodic worker. All fourteen tests also run with `zig build test -Doptimize=ReleaseSafe`.
 
 Hardware references: [Intel APIC timer documentation](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html), [QEMU PIT implementation](https://github.com/qemu/qemu/blob/master/hw/timer/i8254.c), and [QEMU speaker/gate port implementation](https://github.com/qemu/qemu/blob/master/hw/audio/pcspk.c).
+
+
+## Interactive shell
+
+Run `zig build run`, focus the QEMU window, and enter commands at `os> `. The shell is the sole async keyboard consumer at boot. It processes one character per poll, yields while input is buffered, and suspends on an empty queue. The periodic worker continues running and routes its messages through `Shell.notify`, preserving the current input and redrawing the prompt afterward.
+
+| Command | Output |
+| --- | --- |
+| `help` | Available commands and editing keys |
+| `mem` | Managed/free physical RAM and frames, heap capacity/free/used bytes, and live heap allocations |
+| `tasks` | Live task slot/generation IDs, names, and running/ready/waiting states |
+| `clear` | Clear the screen and move the prompt to the top |
+
+Commands are case-sensitive, accept surrounding whitespace, and take no arguments. Blank input does nothing; unknown commands and unexpected arguments report an error. Heap used bytes include allocator metadata and alignment padding. Task state is a snapshot: the shell itself is running while printing `tasks`, and a sleeping worker appears as waiting. Completed tasks disappear from the list.
+
+Editing supports printable ASCII, Backspace/Delete-byte to erase the last character, Ctrl-U to clear the line, Ctrl-W to erase the last word, and Ctrl-C to cancel input without executing it. Tab inserts one space. Input is limited to 128 characters; additional characters are rejected with a message until space is freed. Long lines show the tail on one prompt row, with `<` indicating hidden text to the left. Arrow-key movement, history, completion, quoting, pipelines, and launching programs are not implemented yet.
+
+`Executor.spawnNamed` supplies diagnostic names; the existing `spawn` API still works and uses `task`. Names must remain valid for the task lifetime and any retained snapshots. `Executor.snapshot` copies task information with interrupts briefly disabled, allowing formatting afterward. The shell needs no heap allocations. Background tasks should use `Shell.notify` in task context instead of writing directly to the framebuffer while a prompt is visible.
+
+`zig build test-shell` covers editing and overflow recovery, whitespace and invalid commands, live memory statistics, task snapshots, background output with unfinished input, prompt clipping/clearing, cursor reset, real PS/2 IRQ delivery of a command, and reader cleanup on cancellation. It runs in the aggregate Debug and ReleaseSafe suites.

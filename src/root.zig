@@ -7,3 +7,5 @@ pub const io = @import("io.zig");
 pub const memory = @import("memory.zig");
 pub const task = @import("task.zig");
 pub const timer = @import("timer.zig");
+pub const shell = @import("shell.zig");
+pub const console = @import("console.zig");

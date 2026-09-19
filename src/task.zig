@@ -44,6 +44,7 @@ pub const Waker = struct {
 };
 
 const Slot = struct {
+    name: []const u8 = "task",
     context: *anyopaque = undefined,
     poll: ?PollFn = null,
     cleanup: ?CleanupFn = null,
@@ -99,6 +100,11 @@ pub const Executor = struct {
     /// event subscriptions and free context storage, but must not run the executor.
     /// All APIs except Waker.wake/isActive are for task context after APIC setup.
     pub fn spawn(self: *Executor, context: *anyopaque, poll: PollFn, cleanup: ?CleanupFn) !Waker {
+        return self.spawnNamed("task", context, poll, cleanup);
+    }
+
+    /// Name storage must outlive the task and any retained diagnostic snapshots.
+    pub fn spawnNamed(self: *Executor, name: []const u8, context: *anyopaque, poll: PollFn, cleanup: ?CleanupFn) !Waker {
         const enabled = irq.enabled();
         irq.disable();
         defer restore(enabled);
@@ -106,6 +112,7 @@ pub const Executor = struct {
             if (slot.poll != null or slot.generation == std.math.maxInt(u64)) continue;
             slot.generation += 1;
             slot.context = context;
+            slot.name = name;
             slot.poll = poll;
             slot.cleanup = cleanup;
             self.count += 1;
@@ -145,6 +152,33 @@ pub const Executor = struct {
         irq.disable();
         defer restore(enabled);
         return self.count;
+    }
+
+    pub const TaskInfo = struct {
+        slot: usize,
+        generation: u64,
+        name: []const u8,
+        state: enum { running, ready, waiting },
+    };
+
+    /// Copies up to output.len live tasks without holding IF clear during printing.
+    pub fn snapshot(self: *Executor, output: []TaskInfo) []TaskInfo {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        var count: usize = 0;
+        for (self.slots, 0..) |slot, index| {
+            if (slot.poll == null) continue;
+            if (count == output.len) break;
+            output[count] = .{
+                .slot = index,
+                .generation = slot.generation,
+                .name = slot.name,
+                .state = if (self.polling == @as(u5, @intCast(index))) .running else if (self.ready & (@as(u32, 1) << @intCast(index)) != 0) .ready else .waiting,
+            };
+            count += 1;
+        }
+        return output[0..count];
     }
 
     /// Poll at most one ready task, round-robin. Poll runs with interrupts enabled;

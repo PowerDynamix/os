@@ -130,7 +130,20 @@ pub const Console = struct {
     }
 
     pub fn clear(self: *Console) void {
-        self.fb.clear(0x000000);
+        self.fb.clear(self.bg_color);
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+
+    /// Erase the current text row without affecting output above it.
+    pub fn clearLine(self: *Console) void {
+        const end = @min(self.fb.height, self.cursor_y + self.font.height);
+        var y = self.cursor_y;
+        while (y < end) : (y += 1) {
+            const offset: usize = @as(usize, y) * self.fb.stride;
+            @memset(self.fb.base[offset .. offset + self.fb.width], self.bg_color);
+        }
+        self.cursor_x = 0;
     }
 
     /// Internal line-break engine that triggers standard full-frame scrolling operations
