@@ -13,11 +13,12 @@ This is a UEFI os kernel written in zig for personal study.
 - An 8 MiB heap, plus bump, arena, and fixed-object pool allocation
 - Page-fault diagnostics and hardware-tested read-only/non-executable pages
 - Cooperative multitasking with IRQ wakeups and an async keyboard task
+- Calibrated APIC timer, task sleep, and absolute deadlines
 - QEMU integration tests (with serial logger)
 
 ## Exception handling tests
 
-Run `zig build test` to execute all twelve QEMU tests. Individual exception tests:
+Run `zig build test` to execute all thirteen QEMU tests. Individual exception tests:
 
 - `zig build test-idt-layout`: loaded IDT/GDT limits, gate addresses and flags, TSS/IST setup, and table reload.
 - `zig build test-breakpoint`: actual `int3` delivery and saved register frame.
@@ -93,12 +94,13 @@ Memory tests:
 
 `src/task.zig` provides a single-CPU, stackless executor for up to 32 tasks. Each task has a caller-owned context and a poll function returning `.yield` (schedule another turn), `.pending` (wait for an event to wake it), or `.complete` (release its slot). Ready tasks run round-robin. The executor clears readiness before polling so a wake during the poll is retained, and repeated wakes coalesce. A task generation identifies each slot lifetime; late wakes cannot target a replacement task. Cancelled and completed tasks run their optional cleanup exactly once.
 
-`src/examples/tasks.zig` contains two examples started by `main.zig`:
+`src/examples/tasks.zig` contains these examples; `main.zig` starts `PeriodicWorker` and `Keyboard`:
 
-- `Counter` adds 1 through 5, prints its progress, yields between steps, and completes with a total of 15.
+- `Counter` is the original basic execution example: it adds 1 through 5, yields between steps, and completes with a total of 15.
+- `PeriodicWorker` sleeps between five progress messages, roughly one second apart, then completes.
 - `Keyboard` waits for input with `keyboard.pollRead`, echoes one character per poll, and yields while draining buffered input. An empty FIFO suspends it until IRQ1 wakes it. Its cleanup detaches the keyboard subscription.
 
-Run `zig build run` to see the worker output, then type in QEMU to exercise the keyboard task. Both tasks are registered together; the worker can finish while the keyboard task waits for input. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
+Run `zig build run` and type while the periodic worker prints progress. Both tasks are registered together; the keyboard remains responsive while the worker sleeps and stays active after the worker completes. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
 
 A minimal execution example, after memory, APIC, and keyboard initialization:
 
@@ -131,3 +133,35 @@ Polls run with interrupts enabled. Task state survives in the context across cal
 Keep the executor and task contexts at stable addresses. Contexts must live until completion/cancellation; the executor must outlive all retained wake handles. An optional cleanup callback can release heap-owned contexts and detach event subscriptions. Cleanup runs with interrupts disabled and must be short; it must not run the executor. Use `executor.cancel(handle)` to cancel a task; cancellation of the currently polling task is rejected (return `.complete` instead). Do not reset or copy a live executor. There is one outstanding async keyboard reader; competing subscriptions receive `ReaderBusy`. Do not mix a separate `keyboard.pop()` consumer with it.
 
 `zig build test-tasks` checks round-robin execution, completion and cancellation cleanup, pending tasks without busy polling, wake coalescing, waking during a poll, stale handles, slot capacity/reuse, interrupt-state restoration, APIC wake from idle, and real IRQ1 delivery to the async reader. It also verifies reader cancellation and input already buffered before subscription. The aggregate Debug and ReleaseSafe suites include this test.
+
+
+## Timer-backed sleep and deadlines
+
+Call `timer.init()` after `apic.init()` with interrupts disabled. Boot now does this after keyboard initialization. Calibration uses three approximately 10 ms PIT channel-2 one-shots and the smallest measured LAPIC count, then starts a periodic APIC interrupt every 10 ms. PIT IRQ0 is never enabled; the speaker is disabled during measurement. Calibration is bounded and reports failure if the PIT does not produce the expected transition or the APIC count is invalid. It requires a legacy PC/AT PIT and takes ownership of channel 2, restoring its gate/speaker control bits afterward but not its previous mode/count.
+
+`timer.now()` returns a monotonic millisecond tick count since initialization. `task.sleep(milliseconds)` creates a sleep value with a fixed deadline; keep it in the task context and call `sleep.poll(waker)` on subsequent polls. It returns `false` while waiting and `true` when due. A wake from another event does not restart the stored sleep. Zero-length sleeps and past deadlines complete immediately. Positive durations round up to ticks and add one tick to cover the unknown tick phase; arithmetic overflow returns `error.Overflow`.
+
+```zig
+const task = @import("task.zig");
+
+const DelayedJob = struct {
+    wait: ?task.Sleep = null,
+
+    fn poll(context: *anyopaque, waker: task.Waker) task.Poll {
+        const self: *DelayedJob = @ptrCast(@alignCast(context));
+        if (self.wait == null) self.wait = task.sleep(1000) catch return .complete;
+        const ready = self.wait.?.poll(waker) catch return .complete;
+        if (!ready) return .pending;
+        // Perform work after the delay. A repeating job can clear wait and yield.
+        return .complete;
+    }
+};
+```
+
+Use `task.sleepUntil(deadline_ms)` for an absolute deadline in the `timer.now()` clock domain. Repeated absolute deadlines can maintain a fixed schedule; decide whether to catch up or skip intervals if work runs late. Relative sleeps begin when created, not when first polled. There is one outstanding timer subscription per task and 32 across all executors. Polling a different sleep replaces that task's registration. `task.Sleep.cancel(waker)` abandons a wait; task completion and cancellation also remove it automatically before context cleanup or slot reuse. Queue exhaustion returns `error.TimerCapacityExceeded`.
+
+Timer IRQs only advance the clock and wake due tasks. They do not poll tasks, allocate, print, or preempt the current task. The executor still halts when no task is runnable; periodic ticks may wake the CPU without making a task runnable. Task execution can occur later than its deadline. This clock counts delivered interrupts: long periods with interrupts masked can lose/coalesce ticks and delay timekeeping. It is not a wall clock or a hard real-time timer, and power states that stop the LAPIC timer are unsupported. Do not use the raw APIC one-shot/stop/calibration APIs or reinitialize the APIC after starting the timer service, since they share its hardware timer and vector.
+
+`zig build test-timer` checks calibration against a separate 50 ms PIT interval, repeated periodic delivery and EOI, deadline rounding and overflow, ordered and equal-deadline sleepers, unrelated wakes, cancellation and slot reuse, immediate deadlines, queue capacity, and keyboard IRQ delivery alongside a periodic worker. All thirteen tests also run with `zig build test -Doptimize=ReleaseSafe`.
+
+Hardware references: [Intel APIC timer documentation](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html), [QEMU PIT implementation](https://github.com/qemu/qemu/blob/master/hw/timer/i8254.c), and [QEMU speaker/gate port implementation](https://github.com/qemu/qemu/blob/master/hw/audio/pcspk.c).

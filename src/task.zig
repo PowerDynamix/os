@@ -2,6 +2,7 @@
 //! poll functions must return promptly. No separate stacks or timer preemption.
 const std = @import("std");
 const irq = @import("interrputs.zig");
+const timer = @import("timer.zig");
 
 pub const Poll = enum { pending, yield, complete };
 pub const PollFn = *const fn (*anyopaque, Waker) Poll;
@@ -47,7 +48,43 @@ const Slot = struct {
     poll: ?PollFn = null,
     cleanup: ?CleanupFn = null,
     generation: u64 = 0,
+    waker: Waker = undefined,
 };
+
+/// Store this value in task context across polls; creating it again restarts delay.
+/// One outstanding sleep per task. Completion/cancellation automatically detaches it.
+pub const Sleep = struct {
+    deadline: timer.Instant,
+
+    pub fn poll(self: Sleep, waker: Waker) !bool {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        if (!waker.valid()) return error.InvalidTask;
+        return timer.waitUntil(self.deadline, &waker.executor.slots[waker.slot], wakeSleepingTask);
+    }
+
+    /// Abandon an in-progress sleep when selecting another event in the same task.
+    pub fn cancel(waker: Waker) void {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        if (waker.valid()) timer.cancel(&waker.executor.slots[waker.slot]);
+    }
+};
+
+pub fn sleep(duration_ms: u64) !Sleep {
+    return .{ .deadline = try timer.deadlineAfter(duration_ms) };
+}
+
+pub fn sleepUntil(deadline: timer.Instant) Sleep {
+    return .{ .deadline = deadline };
+}
+
+fn wakeSleepingTask(context: *anyopaque) void {
+    const slot: *Slot = @ptrCast(@alignCast(context));
+    slot.waker.wake();
+}
 
 pub const Executor = struct {
     slots: [capacity]Slot = @splat(.{}),
@@ -74,7 +111,8 @@ pub const Executor = struct {
             self.count += 1;
             const index: u5 = @intCast(i);
             self.ready |= @as(u32, 1) << index;
-            return .{ .executor = self, .slot = index, .generation = slot.generation };
+            slot.waker = .{ .executor = self, .slot = index, .generation = slot.generation };
+            return slot.waker;
         }
         return error.TaskCapacityExceeded;
     }
@@ -85,6 +123,7 @@ pub const Executor = struct {
         const context = slot.context;
         const cleanup = slot.cleanup;
         const waker: Waker = .{ .executor = self, .slot = index, .generation = slot.generation };
+        timer.cancel(slot);
         slot.poll = null;
         slot.cleanup = null;
         self.ready &= ~(@as(u32, 1) << index);

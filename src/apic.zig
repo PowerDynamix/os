@@ -141,6 +141,67 @@ pub fn start_timer(count: u32, handler: irq.IrqHandler) void {
     write(0x320, timer_vector);
     write(0x380, count);
 }
+
+pub const calibration_ms: u64 = 10;
+
+/// Boot-time PC/AT calibration using PIT channel 2, never IRQ0. Takes ownership
+/// of channel 2; restores its gate/speaker bits, not the firmware PIT mode/count.
+/// Must run before starting a timer service, after init(), with IF clear.
+pub fn calibrateTimer() !u32 {
+    std.debug.assert(!irq.enabled());
+    if (lapic == 0) return error.ApicNotInitialized;
+    if (!topology.legacy_pic) return error.LegacyPitUnavailable;
+    const port61 = io.inb(0x61);
+    defer io.outb(0x61, port61);
+    defer stop_timer();
+    write(0x320, masked | timer_vector);
+    write(0x3e0, 0x3); // Divide by 16, also used for normal timer operation.
+    const pit_count: u16 = 11932; // 1,193,182 Hz, rounded to a 10 ms interval.
+    var best: u32 = std.math.maxInt(u32);
+    for (0..3) |_| {
+        io.outb(0x61, port61 & ~@as(u8, 3)); // Gate low, speaker off.
+        io.outb(0x43, 0xb2); // Channel 2, low/high bytes, mode 1, binary.
+        io.outb(0x42, @truncate(pit_count));
+        io.outb(0x42, @truncate(pit_count >> 8));
+        write(0x380, std.math.maxInt(u32));
+        io.outb(0x61, (port61 & ~@as(u8, 3)) | 1); // Rising gate starts one-shot.
+        // Observe both edges. A missing PIT reading 0xff must not look calibrated.
+        var low_seen = false;
+        var completed = false;
+        for (0..10_000_000) |_| {
+            const high = io.inb(0x61) & 0x20 != 0;
+            if (!high) low_seen = true;
+            if (high and low_seen) {
+                completed = true;
+                break;
+            }
+            io.pause();
+        }
+        if (!completed) return error.TimerCalibrationTimeout;
+        const remaining = read(0x390);
+        const elapsed = std.math.maxInt(u32) - remaining;
+        if (remaining == 0 or elapsed < 100) return error.InvalidTimerCalibration;
+        // Minimize extra delay from firmware/VM scheduling during measurement.
+        best = @min(best, elapsed);
+    }
+    return best;
+}
+
+/// Exclusive timer owner: do not mix with start_timer/calibrateTimer while live.
+pub fn start_periodic_timer(count: u32, handler: irq.IrqHandler) void {
+    std.debug.assert(!irq.enabled() and count != 0);
+    stop_timer();
+    irq.register_irq(timer_vector, handler);
+    write(0x3e0, 0x3);
+    write(0x320, (@as(u32, 1) << 17) | timer_vector);
+    write(0x380, count);
+}
+
+pub fn stop_timer() void {
+    std.debug.assert(!irq.enabled());
+    write(0x320, masked | timer_vector);
+    write(0x380, 0);
+}
 pub fn in_service(vector: u8) bool {
     return read(0x100 + @as(usize, vector / 32) * 0x10) & (@as(u32, 1) << @as(u5, @truncate(vector))) != 0;
 }

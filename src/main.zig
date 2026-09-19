@@ -11,6 +11,7 @@ const apic = @import("apic.zig");
 const keyboard = @import("keyboard.zig");
 const memory = @import("memory.zig");
 const task = @import("task.zig");
+const timer = @import("timer.zig");
 const examples = @import("examples/tasks.zig");
 
 const font_data = @embedFile("assets/fonts/ter-u16n.psf");
@@ -153,6 +154,9 @@ pub fn main() uefi.Status {
     keyboard.init() catch |err| {
         cs.k_console.panic("PS/2 keyboard initialization failed: {s}", .{@errorName(err)});
     };
+    timer.init() catch |err| {
+        cs.k_console.panic("Timer initialization failed: {s}", .{@errorName(err)});
+    };
 
     // -------------------------------------------------------------------------
     // Display boot information, then consume keyboard input.
@@ -170,11 +174,12 @@ pub fn main() uefi.Status {
 
     cs.k_console.print("GOP Framebuffer Base:   0x{X}\n", .{framebuffer_addr});
 
-    cs.k_console.print("Starting worker and async keyboard tasks.\n", .{});
+    cs.k_console.print("Timer: {} ms/tick ({} APIC counts).\n", .{ timer.tick_ms, timer.countsPerTick() });
+    cs.k_console.print("Starting periodic worker and async keyboard tasks. Type while it runs:\n", .{});
     var executor: task.Executor = .{};
-    var worker: examples.Counter = .{};
+    var worker: examples.PeriodicWorker = .{};
     var input: examples.Keyboard = .{};
-    _ = executor.spawn(&worker, examples.Counter.poll, null) catch |err| {
+    _ = executor.spawn(&worker, examples.PeriodicWorker.poll, null) catch |err| {
         cs.k_console.panic("Worker spawn failed: {s}", .{@errorName(err)});
     };
     _ = executor.spawn(&input, examples.Keyboard.poll, examples.Keyboard.cleanup) catch |err| {
