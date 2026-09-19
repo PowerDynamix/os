@@ -50,6 +50,78 @@ const Slot = struct {
     cleanup: ?CleanupFn = null,
     generation: u64 = 0,
     waker: Waker = undefined,
+    wait: WaitNode = .{},
+};
+
+const WaitNode = struct {
+    owner: ?*WaitQueue = null,
+    previous: ?*WaitNode = null,
+    next: ?*WaitNode = null,
+    waker: Waker = undefined,
+
+    fn unlink(self: *WaitNode) void {
+        const queue = self.owner orelse return;
+        if (self.previous) |node| node.next = self.next else queue.first = self.next;
+        if (self.next) |node| node.previous = self.previous else queue.last = self.previous;
+        queue.count -= 1;
+        self.owner = null;
+        self.previous = null;
+        self.next = null;
+    }
+};
+
+/// Intrusive, allocation-free task wait list. One channel/event wait per task.
+/// Keep the queue stable until empty. Executor completion/cancellation detaches
+/// nodes automatically. Condition checks and wait() must share an IF-clear region.
+pub const WaitQueue = struct {
+    first: ?*WaitNode = null,
+    last: ?*WaitNode = null,
+    count: usize = 0,
+
+    pub fn wait(self: *WaitQueue, waker: Waker) !void {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        if (!waker.valid()) return error.InvalidTask;
+        const node = &waker.executor.slots[waker.slot].wait;
+        if (node.owner == self) return;
+        if (node.owner != null) return error.AlreadyWaiting;
+        node.owner = self;
+        node.previous = self.last;
+        node.next = null;
+        node.waker = waker;
+        if (self.last) |last| last.next = node else self.first = node;
+        self.last = node;
+        self.count += 1;
+    }
+
+    pub fn cancel(self: *WaitQueue, waker: Waker) void {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        if (!waker.valid()) return;
+        const node = &waker.executor.slots[waker.slot].wait;
+        if (node.owner == self) node.unlink();
+    }
+
+    /// Wake all contenders to avoid stranding work when a woken task is cancelled.
+    /// A wake means retry the condition; it does not reserve a resource.
+    pub fn wakeAll(self: *WaitQueue) void {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        while (self.first) |node| {
+            node.unlink();
+            node.waker.wake();
+        }
+    }
+
+    pub fn waiterCount(self: *WaitQueue) usize {
+        const enabled = irq.enabled();
+        irq.disable();
+        defer restore(enabled);
+        return self.count;
+    }
 };
 
 /// Store this value in task context across polls; creating it again restarts delay.
@@ -130,6 +202,7 @@ pub const Executor = struct {
         const context = slot.context;
         const cleanup = slot.cleanup;
         const waker: Waker = .{ .executor = self, .slot = index, .generation = slot.generation };
+        slot.wait.unlink();
         timer.cancel(slot);
         slot.poll = null;
         slot.cleanup = null;

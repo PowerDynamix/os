@@ -6,6 +6,7 @@ const TestCase = struct {
     scenario: []const u8 = "",
 };
 const tests = [_]TestCase{
+    .{ .name = "communication", .source = "src/tests/communication.zig" },
     .{ .name = "shell", .source = "src/tests/shell.zig" },
     .{ .name = "timer", .source = "src/tests/timer.zig" },
     .{ .name = "tasks", .source = "src/tests/tasks.zig" },

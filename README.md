@@ -15,11 +15,12 @@ This is a UEFI os kernel written in zig for personal study.
 - Cooperative multitasking with IRQ wakeups and an async keyboard task
 - Calibrated APIC timer, task sleep, and absolute deadlines
 - Interactive shell with line editing and memory/task diagnostics
+- Bounded FIFO channels and manual-reset events for task communication
 - QEMU integration tests (with serial logger)
 
 ## Exception handling tests
 
-Run `zig build test` to execute all fourteen QEMU tests. Individual exception tests:
+Run `zig build test` to execute all fifteen QEMU tests. Individual exception tests:
 
 - `zig build test-idt-layout`: loaded IDT/GDT limits, gate addresses and flags, TSS/IST setup, and table reload.
 - `zig build test-breakpoint`: actual `int3` delivery and saved register frame.
@@ -101,7 +102,7 @@ Memory tests:
 - `PeriodicWorker` sleeps between five progress messages, roughly one second apart, then completes.
 - `Keyboard` waits for input with `keyboard.pollRead`, echoes one character per poll, and yields while draining buffered input. An empty FIFO suspends it until IRQ1 wakes it. Its cleanup detaches the keyboard subscription.
 
-Run `zig build run` and type while the periodic worker prints progress. Both tasks are registered together; the shell remains responsive while the worker sleeps and stays active after the worker completes. Worker output preserves the prompt and partially typed command. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
+Run `zig build run` and type while the periodic worker prints progress. These tasks are registered together with the message demo; the shell remains responsive while the worker sleeps and stays active after the worker completes. Worker output preserves the prompt and partially typed command. The async interface uses explicit state machines and wake handles, without Zig language-level `async`/`await` syntax.
 
 A minimal execution example, after memory, APIC, and keyboard initialization:
 
@@ -163,7 +164,7 @@ Use `task.sleepUntil(deadline_ms)` for an absolute deadline in the `timer.now()`
 
 Timer IRQs only advance the clock and wake due tasks. They do not poll tasks, allocate, print, or preempt the current task. The executor still halts when no task is runnable; periodic ticks may wake the CPU without making a task runnable. Task execution can occur later than its deadline. This clock counts delivered interrupts: long periods with interrupts masked can lose/coalesce ticks and delay timekeeping. It is not a wall clock or a hard real-time timer, and power states that stop the LAPIC timer are unsupported. Do not use the raw APIC one-shot/stop/calibration APIs or reinitialize the APIC after starting the timer service, since they share its hardware timer and vector.
 
-`zig build test-timer` checks calibration against a separate 50 ms PIT interval, repeated periodic delivery and EOI, deadline rounding and overflow, ordered and equal-deadline sleepers, unrelated wakes, cancellation and slot reuse, immediate deadlines, queue capacity, and keyboard IRQ delivery alongside a periodic worker. All fourteen tests also run with `zig build test -Doptimize=ReleaseSafe`.
+`zig build test-timer` checks calibration against a separate 50 ms PIT interval, repeated periodic delivery and EOI, deadline rounding and overflow, ordered and equal-deadline sleepers, unrelated wakes, cancellation and slot reuse, immediate deadlines, queue capacity, and keyboard IRQ delivery alongside a periodic worker. All fifteen tests also run with `zig build test -Doptimize=ReleaseSafe`.
 
 Hardware references: [Intel APIC timer documentation](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html), [QEMU PIT implementation](https://github.com/qemu/qemu/blob/master/hw/timer/i8254.c), and [QEMU speaker/gate port implementation](https://github.com/qemu/qemu/blob/master/hw/audio/pcspk.c).
 
@@ -186,3 +187,50 @@ Editing supports printable ASCII, Backspace/Delete-byte to erase the last charac
 `Executor.spawnNamed` supplies diagnostic names; the existing `spawn` API still works and uses `task`. Names must remain valid for the task lifetime and any retained snapshots. `Executor.snapshot` copies task information with interrupts briefly disabled, allowing formatting afterward. The shell needs no heap allocations. Background tasks should use `Shell.notify` in task context instead of writing directly to the framebuffer while a prompt is visible.
 
 `zig build test-shell` covers editing and overflow recovery, whitespace and invalid commands, live memory statistics, task snapshots, background output with unfinished input, prompt clipping/clearing, cursor reset, real PS/2 IRQ delivery of a command, and reader cleanup on cancellation. It runs in the aggregate Debug and ReleaseSafe suites.
+
+
+## Channels and events
+
+`src/sync.zig` provides allocation-free communication for the cooperative, single-CPU executor. `sync.Channel(T, capacity)` is a bounded FIFO supporting multiple producers and consumers. Capacity must be positive. Messages are copied by value; a successful send transfers responsibility for any payload resources to the receiver. A failed/pending send leaves ownership with the sender. Closing never destroys buffered resources: drain them before releasing the channel.
+
+| Operation | Result |
+| --- | --- |
+| `channel.pollSend(value, waker)` | `true` if sent; `false` registers a wait for space |
+| `channel.pollReceive(waker)` | A value if available; `null` registers a wait for data |
+| `channel.trySend(value)` | `true` if sent; `false` if full, without registering a waiter |
+| `channel.tryReceive()` | A value if available; `null` if empty and open |
+| `channel.close()` | Reject new sends, wake senders/receivers, allow buffered messages to drain |
+| `channel.cancel(waker)` | Abandon that task's channel wait without cancelling the task |
+
+Send operations return `error.Closed` after closure. Receives return `error.Closed` only after the closed queue is empty. A pending sender must retain its value in task context and retry it on wake; only advance its producer state after `pollSend` returns `true`. A wake is a request to recheck the condition, not a reservation. Messages are FIFO, but waiter fairness is not guaranteed. Waking all contenders avoids stranding data or capacity when a woken task is cancelled.
+
+```zig
+const task = @import("task.zig");
+const sync = @import("sync.zig");
+
+const Queue = sync.Channel(u32, 4);
+const Receiver = struct {
+    queue: *Queue,
+    total: u32 = 0,
+
+    fn poll(context: *anyopaque, waker: task.Waker) task.Poll {
+        const self: *Receiver = @ptrCast(@alignCast(context));
+        const value = self.queue.pollReceive(waker) catch return .complete;
+        if (value) |number| {
+            self.total += number;
+            return .yield;
+        }
+        return .pending;
+    }
+};
+```
+
+`sync.Event` is a manual-reset event. `event.poll(waker)` returns `false` and parks the task until `signal()` makes the event ready. Signaling before a wait is retained; repeated signals coalesce, and all current waiters are woken. It remains ready until `reset()`. Resetting before a woken task polls makes that task wait again: this is a level-triggered condition, not a counted notification stream. Use a channel when every notification must be consumed. `event.cancel(waker)` abandons a subscription.
+
+The executor stores one intrusive channel/event wait node per task. Completion and cancellation automatically unlink it before context cleanup or slot reuse, without requiring a cleanup callback. Repeated polling of the same wait does not add duplicate registrations. Attempting to park on another channel/event at the same time returns `error.AlreadyWaiting`; explicitly cancel the first wait when switching conditions. Timer and keyboard subscriptions remain separate, so a task can combine a communication wait with a sleep deadline and cancel the losing wait when implementing a timeout.
+
+Keep channels, events, and executors at stable addresses and alive while any task can still use them. Do not copy/reset a live communication object. Condition checks and subscriptions share short interrupt-disabled regions to avoid lost IRQ wakeups. `trySend`, `tryReceive`, `close`, and event `signal`/`reset` can run in IRQ context with small payloads; they never allocate, block, or poll tasks. Wait-list operations preserve the caller's interrupt-enable state. This synchronization is not SMP-safe.
+
+`src/examples/messages.zig` is started at boot alongside the shell and periodic worker. A producer sends 1 through 5 into a two-element queue; a consumer receives approximately every 250 ms and reports a running total of 15 through `Shell.notify`. The producer closes the queue and waits on an event for the consumer's completion acknowledgement. Peer cleanup closes/signals on early termination so the other task can stop. Use `tasks` during the demo to inspect `producer` and `consumer`.
+
+`zig build test-communication` verifies FIFO wraparound and bounds, optional payloads, close/drain behavior, blocked send/receive wakeups, duplicate registration, cancellation and stale-slot safety, event latch/reset/broadcast semantics, real IRQ event and channel delivery, and 200 messages sent by competing producers under backpressure. The aggregate Debug and ReleaseSafe suites include it.

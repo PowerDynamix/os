@@ -9,3 +9,4 @@ pub const task = @import("task.zig");
 pub const timer = @import("timer.zig");
 pub const shell = @import("shell.zig");
 pub const console = @import("console.zig");
+pub const sync = @import("sync.zig");

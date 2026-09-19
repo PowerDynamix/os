@@ -13,6 +13,7 @@ const memory = @import("memory.zig");
 const task = @import("task.zig");
 const timer = @import("timer.zig");
 const shell = @import("shell.zig");
+const messages = @import("examples/messages.zig");
 const examples = @import("examples/tasks.zig");
 
 const font_data = @embedFile("assets/fonts/ter-u16n.psf");
@@ -176,15 +177,22 @@ pub fn main() uefi.Status {
     cs.k_console.print("GOP Framebuffer Base:   0x{X}\n", .{framebuffer_addr});
 
     cs.k_console.print("Timer: {} ms/tick ({} APIC counts).\n", .{ timer.tick_ms, timer.countsPerTick() });
-    cs.k_console.print("Starting periodic worker and shell.\n", .{});
+    cs.k_console.print("Starting shell, periodic worker, and message demo.\n", .{});
     var executor: task.Executor = .{};
     var input = shell.Shell.init(&executor, shell.Output.framebuffer(&cs.k_console));
     var worker: examples.PeriodicWorker = .{ .shell = &input };
+    var message_demo: messages.Demo = .{ .output = &input };
     _ = executor.spawnNamed("periodic-worker", &worker, examples.PeriodicWorker.poll, null) catch |err| {
         cs.k_console.panic("Worker spawn failed: {s}", .{@errorName(err)});
     };
     _ = executor.spawnNamed("shell", &input, shell.Shell.poll, shell.Shell.cleanup) catch |err| {
         cs.k_console.panic("Shell task spawn failed: {s}", .{@errorName(err)});
+    };
+    _ = executor.spawnNamed("producer", &message_demo, messages.Demo.produce, messages.Demo.producerCleanup) catch |err| {
+        cs.k_console.panic("Producer spawn failed: {s}", .{@errorName(err)});
+    };
+    _ = executor.spawnNamed("consumer", &message_demo, messages.Demo.consume, messages.Demo.consumerCleanup) catch |err| {
+        cs.k_console.panic("Consumer spawn failed: {s}", .{@errorName(err)});
     };
     executor.run();
     interrupts.disable();
