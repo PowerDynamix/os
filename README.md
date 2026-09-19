@@ -16,6 +16,7 @@ This is a UEFI os kernel written in zig for personal study.
 - Calibrated APIC timer, task sleep, and absolute deadlines
 - Interactive shell with line editing and memory/task diagnostics
 - Bounded FIFO channels and manual-reset events for task communication
+- Allocator counters, heap integrity/fragmentation diagnostics, and cooperative memory stress tests
 - QEMU integration tests (with serial logger)
 
 ## Exception handling tests
@@ -176,7 +177,9 @@ Run `zig build run`, focus the QEMU window, and enter commands at `os> `. The sh
 | Command | Output |
 | --- | --- |
 | `help` | Available commands and editing keys |
-| `mem` | Managed/free physical RAM and frames, heap capacity/free/used bytes, and live heap allocations |
+| `mem` | RAM/frame counters, heap usage and peaks, allocation/resize counts, fragmentation, and integrity |
+| `memtest` | Start a cooperative allocator stress test on an isolated heap |
+| `memstop` | Cancel the test and release its pages |
 | `tasks` | Live task slot/generation IDs, names, and running/ready/waiting states |
 | `clear` | Clear the screen and move the prompt to the top |
 
@@ -184,7 +187,7 @@ Commands are case-sensitive, accept surrounding whitespace, and take no argument
 
 Editing supports printable ASCII, Backspace/Delete-byte to erase the last character, Ctrl-U to clear the line, Ctrl-W to erase the last word, and Ctrl-C to cancel input without executing it. Tab inserts one space. Input is limited to 128 characters; additional characters are rejected with a message until space is freed. Long lines show the tail on one prompt row, with `<` indicating hidden text to the left. Arrow-key movement, history, completion, quoting, pipelines, and launching programs are not implemented yet.
 
-`Executor.spawnNamed` supplies diagnostic names; the existing `spawn` API still works and uses `task`. Names must remain valid for the task lifetime and any retained snapshots. `Executor.snapshot` copies task information with interrupts briefly disabled, allowing formatting afterward. The shell needs no heap allocations. Background tasks should use `Shell.notify` in task context instead of writing directly to the framebuffer while a prompt is visible.
+`Executor.spawnNamed` supplies diagnostic names; the existing `spawn` API still works and uses `task`. Names must remain valid for the task lifetime and any retained snapshots. `Executor.snapshot` copies task information with interrupts briefly disabled, allowing formatting afterward. Normal shell commands need no heap allocations. `memtest` maps an isolated heap for its exercise. Background tasks should use `Shell.notify` in task context instead of writing directly to the framebuffer while a prompt is visible.
 
 `zig build test-shell` covers editing and overflow recovery, whitespace and invalid commands, live memory statistics, task snapshots, background output with unfinished input, prompt clipping/clearing, cursor reset, real PS/2 IRQ delivery of a command, and reader cleanup on cancellation. It runs in the aggregate Debug and ReleaseSafe suites.
 
@@ -234,3 +237,20 @@ Keep channels, events, and executors at stable addresses and alive while any tas
 `src/examples/messages.zig` is started at boot alongside the shell and periodic worker. A producer sends 1 through 5 into a two-element queue; a consumer receives approximately every 250 ms and reports a running total of 15 through `Shell.notify`. The producer closes the queue and waits on an event for the consumer's completion acknowledgement. Peer cleanup closes/signals on early termination so the other task can stop. Use `tasks` during the demo to inspect `producer` and `consumer`.
 
 `zig build test-communication` verifies FIFO wraparound and bounds, optional payloads, close/drain behavior, blocked send/receive wakeups, duplicate registration, cancellation and stale-slot safety, event latch/reset/broadcast semantics, real IRQ event and channel delivery, and 200 messages sent by competing producers under backpressure. The aggregate Debug and ReleaseSafe suites include it.
+
+
+## Memory diagnostics and stress testing
+
+`mem` now reports live requested bytes separately from occupied heap bytes (including allocation headers, alignment padding, and capacity retained after shrinking). It also shows peak occupied bytes, cumulative successful allocation/free callbacks, allocation failures, successful/rejected in-place resize callbacks, free-block count, and the largest free block. External fragmentation is `(free_bytes - largest_free_block) * 100 / free_bytes`, rounded down, or zero when no free bytes remain. Free-block sizes are raw extents; a payload also needs header and alignment space.
+
+Counters belong to each allocator instance and start at zero on initialization. Lifetime counters saturate rather than wrap. They count allocator callbacks, so a moving `realloc` can add an allocation and a free; a rejected resize is not necessarily a failed user allocation. Zig zero-sized operations may bypass callbacks. Frame diagnostics include current/peak allocated frames, allocation/free totals, allocation failures, and usable-region count. Reserved firmware memory is excluded from the managed-frame totals.
+
+`Heap.inspect()` checks free-list pointer bounds/alignment before dereferencing, sorted non-overlapping and coalesced blocks, block sizes, and free/occupied byte accounting. It reports `error.CorruptHeap` rather than following a cycle forever. This is a structural diagnostic, not a complete memory-safety detector: arbitrary writes into live allocation headers are not exhaustively checked. Inspection and allocation remain single-CPU task-context operations.
+
+Run `memtest` for 2,048 deterministic operations with up to 32 live buffers, sizes from 1 through 4,096 bytes, and 64-byte alignment. It checks position-dependent data patterns, realloc prefix preservation, periodic heap integrity, complete coalescing after freeing everything, and an intentional out-of-memory request. Each step yields to other tasks. Completion reports PASS/FAILED through the shell without discarding typed input; `tasks` lists the running test as `memtest`.
+
+The stress heap is a separate 256 KiB instance of the same allocator used by the kernel. It occupies a reserved virtual range beginning at `0xffff800080001000` with guard pages. Kernel heap allocations and their counters are unaffected; physical frame counters reflect the test's backing pages and page tables. `memstop`, task completion, shell cancellation, startup failure, and test failure release those mappings. Only one instance can occupy that range. The fixed size and seed keep runs bounded and reproducible; this is an allocator test, not an exhaustive physical RAM test.
+
+`Heap.discard()` supports exclusive-owner teardown by invalidating all remaining allocations and releasing mappings without walking potentially damaged free-list/allocation metadata. Ordinary heap users should continue freeing their allocations before `deinit()`. No pointers into a discarded heap may be used afterward.
+
+`zig build test-memory` verifies counter accounting across allocation, resize, free, and OOM; fragmentation/coalescing statistics; malformed free-list detection; successful stress runs; cancellation; injected data corruption; and backing-frame reclamation. `zig build test-shell` also verifies `memtest`/`memstop`, duplicate starts, task-capacity failure cleanup, diagnostic output, and shell teardown while a test is active. The existing fifteen-test Debug and ReleaseSafe suites include these checks.

@@ -167,11 +167,30 @@ pub fn main() uefi.Status {
     check(capture.contains("2 live task(s)") and capture.contains("waiting  worker") and capture.contains("running  shell"), "IRQ shell tasks command\n");
     executor.cancel(worker) catch |err| failed(err);
     check(executor.snapshot(&infos).len == 1, "Completed task still listed\n");
+    const frames_before = kernel.memory.physical.free_count;
+    feed(&shell, "memtest\nmemtest\n");
+    check(shell.stress_handle != null and capture.contains("already running"), "Stress duplicate start\n");
+    // Advance partway, then cancel while allocations are live.
+    for (0..20) |_| _ = executor.step();
+    feed(&shell, "memstop\n");
+    check(shell.stress_handle == null and kernel.memory.physical.free_count == frames_before, "Stress command cancellation\n");
+    feed(&shell, "memtest\n");
+    while (executor.step()) {}
+    check(shell.stress_handle == null and capture.contains("Memory test PASS") and kernel.memory.physical.free_count == frames_before, "Stress command completion\n");
+    feed(&shell, "mem\n");
+    check(capture.contains("Heap integrity: OK") and capture.contains("external fragmentation:"), "Diagnostic command output\n");
+    feed(&shell, "memtest\n");
     executor.cancel(handle) catch |err| failed(err);
+    check(shell.stress_handle == null and kernel.memory.physical.free_count == frames_before, "Shell cleanup left stress task alive\n");
     const replacement = executor.spawnNamed("new-shell", &shell, kernel.shell.Shell.poll, kernel.shell.Shell.cleanup) catch |err| failed(err);
     _ = executor.step();
     check(replacement.isActive() and !executor.step(), "Shell cancellation did not detach reader\n");
     executor.cancel(replacement) catch |err| failed(err);
+    var handles: [kernel.task.capacity]kernel.task.Waker = undefined;
+    for (&handles) |*entry| entry.* = executor.spawn(&dummy, parked, null) catch |err| failed(err);
+    feed(&shell, "memtest\n");
+    check(shell.stress_handle == null and kernel.memory.physical.free_count == frames_before and capture.contains("TaskCapacityExceeded"), "Stress spawn failure leaked pages\n");
+    for (handles) |entry| executor.cancel(entry) catch |err| failed(err);
     check(kernel.memory.heap.live_allocations == 0, "Shell leaked memory\n");
     serial.writeString("Real keyboard shell command, task states and reader cleanup passed\n");
     runner.exitQemu(.Success);

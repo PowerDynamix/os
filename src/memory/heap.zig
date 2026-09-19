@@ -14,6 +14,43 @@ pub const Heap = struct {
     size: usize,
     head: ?*Block,
     live_allocations: usize = 0,
+    used_bytes: usize = 0,
+    requested_bytes: usize = 0,
+    peak_used_bytes: usize = 0,
+    allocations: u64 = 0,
+    frees: u64 = 0,
+    allocation_failures: u64 = 0,
+    resizes: u64 = 0,
+    resize_failures: u64 = 0,
+
+    pub const Stats = struct {
+        free_bytes: usize,
+        free_blocks: usize,
+        largest_free_block: usize,
+    };
+
+    /// Task context only. Validate before following free-list pointers, including
+    /// order/coalescing and byte accounting. Never allocate to inspect the heap.
+    pub fn inspect(self: *const Heap) error{CorruptHeap}!Stats {
+        var result: Stats = .{ .free_bytes = 0, .free_blocks = 0, .largest_free_block = 0 };
+        var current = self.head;
+        var previous_end: ?usize = null;
+        const end = self.start + self.size;
+        while (current) |block| {
+            const address = @intFromPtr(block);
+            if (address < self.start or address > end - @sizeOf(Block) or address % @alignOf(Block) != 0) return error.CorruptHeap;
+            if (previous_end) |last| if (address <= last) return error.CorruptHeap;
+            if (block.size < @sizeOf(Block) or block.size % unit != 0 or block.size > end - address) return error.CorruptHeap;
+            result.free_bytes += block.size;
+            result.free_blocks += 1;
+            result.largest_free_block = @max(result.largest_free_block, block.size);
+            previous_end = address + block.size;
+            current = block.next;
+        }
+        if (self.used_bytes > self.size or result.free_bytes != self.size - self.used_bytes or self.requested_bytes > self.used_bytes) return error.CorruptHeap;
+        if (self.live_allocations == 0 and self.used_bytes != 0) return error.CorruptHeap;
+        return result;
+    }
 
     /// Commit a fixed page budget; callers select capacity. Leave guard pages on
     /// both sides. Mapping failure rolls back all frames and intermediate tables.
@@ -47,6 +84,12 @@ pub const Heap = struct {
     /// All allocations (including arenas and pools) must be freed first.
     pub fn deinit(self: *Heap) void {
         std.debug.assert(self.live_allocations == 0);
+        self.discard();
+    }
+
+    /// Invalidate ALL allocations and release backing pages without walking heap
+    /// metadata. Caller must exclusively own the heap and stop all of its users.
+    pub fn discard(self: *Heap) void {
         var offset: usize = 0;
         while (offset < self.size) : (offset += paging.page_size) {
             const frame = self.pager.unmap(self.start + offset) catch unreachable;
@@ -69,6 +112,12 @@ pub const Heap = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
         const self: *Heap = @ptrCast(@alignCast(ctx));
+        const result = self.allocate(len, alignment);
+        if (result == null) self.allocation_failures +|= 1;
+        return result;
+    }
+
+    fn allocate(self: *Heap, len: usize, alignment: Alignment) ?[*]u8 {
         const align_bytes = @max(unit, alignment.toByteUnits());
         var link = &self.head;
         while (link.*) |block| {
@@ -95,15 +144,26 @@ pub const Heap = struct {
             const header: *Header = @ptrFromInt(user - @sizeOf(Header));
             header.* = .{ .start = start, .size = consumed };
             self.live_allocations += 1;
+            self.used_bytes += consumed;
+            self.requested_bytes += len;
+            self.peak_used_bytes = @max(self.peak_used_bytes, self.used_bytes);
+            self.allocations +|= 1;
             return @ptrFromInt(user);
         }
         return null;
     }
 
-    fn resize(_: *anyopaque, memory: []u8, _: Alignment, new_len: usize, _: usize) bool {
+    fn resize(ctx: *anyopaque, memory: []u8, _: Alignment, new_len: usize, _: usize) bool {
+        const self: *Heap = @ptrCast(@alignCast(ctx));
         const header: *const Header = @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(Header));
         // Keep the block on shrink; realloc may move when growth exceeds capacity.
-        return new_len <= header.start + header.size - @intFromPtr(memory.ptr);
+        if (new_len > header.start + header.size - @intFromPtr(memory.ptr)) {
+            self.resize_failures +|= 1;
+            return false;
+        }
+        self.requested_bytes = self.requested_bytes - memory.len + new_len;
+        self.resizes +|= 1;
+        return true;
     }
     fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
         return if (resize(ctx, memory, alignment, new_len, ra)) memory.ptr else null;
@@ -137,5 +197,8 @@ pub const Heap = struct {
             }
         }
         self.live_allocations -= 1;
+        self.used_bytes -= header.size;
+        self.requested_bytes -= memory.len;
+        self.frees +|= 1;
     }
 };

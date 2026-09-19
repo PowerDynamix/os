@@ -46,6 +46,8 @@ pub const Shell = struct {
     len: usize = 0,
     started: bool = false,
     full_reported: bool = false,
+    stress: memory.Stress = undefined,
+    stress_handle: ?task.Waker = null,
 
     pub fn init(executor: *task.Executor, output: Output) Shell {
         return .{ .executor = executor, .output = output };
@@ -133,15 +135,57 @@ pub const Shell = struct {
             return;
         }
         if (std.mem.eql(u8, command, "help")) {
-            self.write("help  - show commands and editing keys\nmem   - show physical RAM and heap usage\ntasks - list live tasks and their states\nclear - clear the screen\nBackspace: erase; Ctrl-U: clear line; Ctrl-W: erase word; Ctrl-C: cancel.\n");
+            self.write("help  - show commands and editing keys\nmem   - show memory diagnostics\nmemtest - start allocator stress test\nmemstop - cancel allocator stress test\ntasks - list live tasks and their states\nclear - clear the screen\nBackspace: erase; Ctrl-U: clear line; Ctrl-W: erase word; Ctrl-C: cancel.\n");
         } else if (std.mem.eql(u8, command, "mem")) {
             self.print("Managed RAM: {} KiB; free: {} KiB ({} frames)\n", .{
                 memory.physical.total_count * 4, memory.physical.free_count * 4, memory.physical.free_count,
             });
-            const free = memory.heap.freeBytes();
+            const stats = memory.heap.inspect() catch |err| {
+                self.print("Heap integrity FAILED: {s}\n", .{@errorName(err)});
+                return;
+            };
+            const free = stats.free_bytes;
             self.print("Heap: {} bytes; free: {}; used incl. metadata/padding: {}; allocations: {}\n", .{
                 memory.heap.size, free, memory.heap.size - free, memory.heap.live_allocations,
             });
+            self.print("Requested: {} bytes; peak occupied: {} bytes\n", .{ memory.heap.requested_bytes, memory.heap.peak_used_bytes });
+            self.print("Heap allocations/frees: {}/{}; OOM: {}; resizes/rejected: {}/{}\n", .{
+                memory.heap.allocations, memory.heap.frees, memory.heap.allocation_failures, memory.heap.resizes, memory.heap.resize_failures,
+            });
+            self.print("Free blocks: {}; largest: {} bytes; external fragmentation: {}%\n", .{
+                stats.free_blocks, stats.largest_free_block, if (free == 0) @as(usize, 0) else (free - stats.largest_free_block) * 100 / free,
+            });
+            self.print("Frames used/peak: {}/{}; alloc/free: {}/{}; OOM: {}; regions: {}\n", .{
+                memory.physical.total_count - memory.physical.free_count, memory.physical.peak_used,
+                memory.physical.allocations,                              memory.physical.frees,
+                memory.physical.allocation_failures,                      memory.physical.region_count,
+            });
+            self.write("Heap integrity: OK\n");
+        } else if (std.mem.eql(u8, command, "memtest")) {
+            if (self.stress_handle != null) {
+                self.write("Memory test already running. Use memstop to cancel.\n");
+                return;
+            }
+            self.stress = memory.Stress.init(&memory.virtual) catch |err| {
+                self.print("Memory test could not start: {s}\n", .{@errorName(err)});
+                return;
+            };
+            self.stress_handle = self.executor.spawnNamed("memtest", self, stressPoll, stressCleanup) catch |err| {
+                self.stress.deinit();
+                self.print("Memory test could not start: {s}\n", .{@errorName(err)});
+                return;
+            };
+            self.write("Memory test started: 2048 operations on an isolated 256 KiB heap.\n");
+        } else if (std.mem.eql(u8, command, "memstop")) {
+            const handle = self.stress_handle orelse {
+                self.write("No memory test is running.\n");
+                return;
+            };
+            self.executor.cancel(handle) catch |err| {
+                self.print("Memory test cancellation failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            self.write("Memory test cancelled; pages released.\n");
         } else if (std.mem.eql(u8, command, "tasks")) {
             var buffer: [task.capacity]task.Executor.TaskInfo = undefined;
             const live = self.executor.snapshot(&buffer);
@@ -164,7 +208,27 @@ pub const Shell = struct {
         self.feed(ch);
         return .yield;
     }
-    pub fn cleanup(_: *anyopaque, waker: task.Waker) void {
+    pub fn cleanup(context: *anyopaque, waker: task.Waker) void {
+        const self: *Shell = @ptrCast(@alignCast(context));
+        if (self.stress_handle) |handle| self.executor.cancel(handle) catch unreachable;
         keyboard.cancelRead(waker);
+    }
+
+    fn stressPoll(context: *anyopaque, _: task.Waker) task.Poll {
+        const self: *Shell = @ptrCast(@alignCast(context));
+        const done = self.stress.step() catch |err| {
+            var text: [128]u8 = undefined;
+            self.notify(std.fmt.bufPrint(&text, "Memory test FAILED: {s}", .{@errorName(err)}) catch "Memory test FAILED");
+            return .complete;
+        };
+        if (!done) return .yield;
+        self.notify("Memory test PASS: data, alignment, realloc, coalescing and OOM verified; releasing pages.");
+        return .complete;
+    }
+
+    fn stressCleanup(context: *anyopaque, _: task.Waker) void {
+        const self: *Shell = @ptrCast(@alignCast(context));
+        self.stress.deinit();
+        self.stress_handle = null;
     }
 };

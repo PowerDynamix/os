@@ -64,6 +64,7 @@ fn frameTests() !void {
     if (physical.free(b)) |_| return error.ExpectedDoubleFree else |err| check(err == error.DoubleFree, "Double free\n");
     if (physical.free(0x3000)) |_| return error.FreedReservedFrame else |err| check(err == error.InvalidFrame, "Reserved frame\n");
     if (physical.free(a + 1)) |_| return error.FreedUnalignedFrame else |err| check(err == error.InvalidFrame, "Unaligned frame\n");
+    check(physical.allocations == 4 and physical.frees == 2 and physical.allocation_failures == 1 and physical.peak_used == 3, "Frame diagnostic counters\n");
     serial.writeString("Frame filtering, exhaustion and reuse passed\n");
 }
 
@@ -124,14 +125,19 @@ fn heapTests() !void {
     const first = try allocator.alloc(u8, 100);
     const second = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
     const third = try allocator.alloc(u64, 73);
+    check(heap.allocations == 3 and heap.requested_bytes == 4780 and heap.used_bytes >= heap.requested_bytes, "Heap allocation counters\n");
+    const initial_stats = try heap.inspect();
+    check(initial_stats.free_bytes + heap.used_bytes == heap.size and heap.peak_used_bytes == heap.used_bytes, "Heap byte accounting\n");
     check(@intFromPtr(second.ptr) % 4096 == 0, "Heap alignment\n");
     @memset(first, 0x5a);
     @memset(second, 0x3c);
     @memset(third, 0x9876);
     allocator.free(second);
+    check((try heap.inspect()).free_blocks == 2 and heap.frees == 1, "Fragmentation metrics\n");
     const grown = try allocator.realloc(first, 3000);
     for (grown[0..100]) |byte| check(byte == 0x5a, "Realloc lost data\n");
     check(allocator.resize(grown, 64), "Heap shrink\n");
+    check(heap.requested_bytes == 64 + 73 * 8 and heap.resizes > 0, "Resize accounting\n");
     allocator.free(@as([]u8, grown[0..64]));
     allocator.free(third);
     check(heap.live_allocations == 0 and heap.freeBytes() == heap.size, "Heap coalescing\n");
@@ -162,6 +168,17 @@ fn heapTests() !void {
         allocator.free(bytes);
     };
     check(heap.freeBytes() == heap.size, "Fragmented heap did not coalesce\n");
+    const diagnostics = try heap.inspect();
+    check(heap.allocations == heap.frees and heap.requested_bytes == 0 and heap.used_bytes == 0, "Final counters\n");
+    check(heap.allocation_failures == 1 and heap.peak_used_bytes == heap.size, "OOM/peak accounting\n");
+    check(diagnostics.free_blocks == 1 and diagnostics.largest_free_block == heap.size, "Coalescing metrics\n");
+    const head = heap.head.?;
+    head.next = head;
+    if (heap.inspect()) |_| return error.MissedFreeListCycle else |err| check(err == error.CorruptHeap, "Cycle detection\n");
+    head.next = null;
+    heap.head = @as(@TypeOf(head), @ptrFromInt(8));
+    if (heap.inspect()) |_| return error.MissedInvalidPointer else |err| check(err == error.CorruptHeap, "Free pointer validation\n");
+    heap.head = head;
     // A conflict halfway through initialization must release all earlier pages.
     const occupied = try memory.physical.alloc();
     const conflict_start = test_address + 16 * paging.page_size;
@@ -204,6 +221,42 @@ fn allocatorDesignTests() !void {
     serial.writeString("Bump, arena and object-pool lifetimes passed\n");
 }
 
+fn diagnosticStressTests() !void {
+    const frames_before = memory.physical.free_count;
+    const kernel_allocations = memory.heap.allocations;
+    var stress = try memory.Stress.init(&memory.virtual);
+    while (!try stress.step()) {}
+    check(stress.iterations == memory.Stress.rounds and stress.heap.allocation_failures == 1, "Stress coverage\n");
+    stress.deinit();
+    check(memory.physical.free_count == frames_before and memory.heap.allocations == kernel_allocations, "Stress isolation/page leak\n");
+    stress = try memory.Stress.init(&memory.virtual);
+    for (0..16) |_| _ = try stress.step();
+    check(stress.heap.live_allocations > 0, "Cancellation did not have live allocations\n");
+    stress.deinit();
+    check(memory.physical.free_count == frames_before, "Cancelled stress leaked frames\n");
+    stress = try memory.Stress.init(&memory.virtual);
+    _ = try stress.step();
+    for (stress.slots) |slot| if (slot) |bytes| {
+        bytes[0] ^= 1;
+        break;
+    };
+    var detected = false;
+    while (true) {
+        const done = stress.step() catch |err| {
+            check(err == error.DataCorruption, "Unexpected stress error\n");
+            detected = true;
+            break;
+        };
+        if (done) break;
+    }
+    check(detected, "Stress failed to detect changed data\n");
+    // Error cleanup must not follow potentially corrupted allocation metadata.
+    if (stress.heap.head) |head| head.next = head;
+    stress.deinit();
+    check(memory.physical.free_count == frames_before, "Failed stress leaked frames\n");
+    serial.writeString("Memory diagnostics, stress success/cancellation and corruption detection passed\n");
+}
+
 pub fn main() uefi.Status {
     serial.initSerial();
     frameTests() catch |err| failed(err);
@@ -239,5 +292,6 @@ pub fn main() uefi.Status {
     mappingTests() catch |err| failed(err);
     heapTests() catch |err| failed(err);
     allocatorDesignTests() catch |err| failed(err);
+    diagnosticStressTests() catch |err| failed(err);
     runner.exitQemu(.Success);
 }

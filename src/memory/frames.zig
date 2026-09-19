@@ -14,6 +14,10 @@ pub const FrameAllocator = struct {
     free_count: usize = 0,
     total_count: usize = 0,
     hint: usize = 0,
+    allocations: u64 = 0,
+    frees: u64 = 0,
+    allocation_failures: u64 = 0,
+    peak_used: usize = 0,
 
     /// Storage must outlive every allocated frame. Do not reinitialize a live allocator.
     pub fn init(self: *FrameAllocator, map: std.os.uefi.tables.MemoryMapSlice) !void {
@@ -21,6 +25,10 @@ pub const FrameAllocator = struct {
         self.region_count = 0;
         self.free_count = 0;
         self.hint = 0;
+        self.allocations = 0;
+        self.frees = 0;
+        self.allocation_failures = 0;
+        self.peak_used = 0;
         var it = map.iterator();
         while (it.next()) |desc| {
             if (desc.type != .conventional_memory or desc.attribute.memory_runtime or
@@ -43,13 +51,18 @@ pub const FrameAllocator = struct {
     }
 
     pub fn alloc(self: *FrameAllocator) error{OutOfMemory}!usize {
-        if (self.free_count == 0) return error.OutOfMemory;
+        if (self.free_count == 0) {
+            self.allocation_failures +|= 1;
+            return error.OutOfMemory;
+        }
         var word = self.hint;
         while (self.used[word] == std.math.maxInt(u64)) word = (word + 1) % self.used.len;
         const bit: u6 = @intCast(@ctz(~self.used[word]));
         self.used[word] |= @as(u64, 1) << bit;
         self.hint = word;
         self.free_count -= 1;
+        self.allocations +|= 1;
+        self.peak_used = @max(self.peak_used, self.total_count - self.free_count);
         return (word * 64 + bit) * page_size;
     }
 
@@ -64,6 +77,7 @@ pub const FrameAllocator = struct {
                 if (self.used[index / 64] & mask == 0) return error.DoubleFree;
                 self.used[index / 64] &= ~mask;
                 self.free_count += 1;
+                self.frees +|= 1;
                 self.hint = @min(self.hint, index / 64);
                 return;
             }

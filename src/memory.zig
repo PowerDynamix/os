@@ -4,6 +4,7 @@ const std = @import("std");
 pub const frames = @import("memory/frames.zig");
 pub const paging = @import("memory/paging.zig");
 pub const Heap = @import("memory/heap.zig").Heap;
+pub const Stress = @import("memory/stress.zig").Stress;
 
 // These designs compose with the kernel heap and need no firmware/OS services.
 /// Bounded bump allocation, with reset and last-allocation reclamation.
