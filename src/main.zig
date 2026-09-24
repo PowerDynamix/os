@@ -1,3 +1,4 @@
+const log = @import("log.zig");
 const std = @import("std");
 const uefi = std.os.uefi;
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
@@ -36,6 +37,7 @@ fn uefi_panic(
     con_out: *uefi.protocol.SimpleTextOutput,
     message: []const u8,
 ) uefi.Status {
+    log.print(.err, "UEFI panic: {s}", .{message});
     _ = con_out.outputString(L("\r\n\r\nKERNEL PANIC!\r\n")) catch {};
 
     // Print the ASCII message as UTF-16.
@@ -62,6 +64,7 @@ pub fn main() uefi.Status {
     // UEFI service handles
     // -------------------------------------------------------------------------
 
+    log.write(.info, "Kernel boot started");
     const con_out = uefi.system_table.con_out.?;
     const boot_services = uefi.system_table.boot_services.?;
 
@@ -145,17 +148,21 @@ pub fn main() uefi.Status {
     };
 
     // Install exception gates before taking ownership of hardware interrupts.
+    log.write(.info, "UEFI Boot Services exited");
     interrupts.init_gdt();
     interrupts.init_idt();
     memory.init(memory_map) catch |err| {
         cs.k_console.panic("Memory initialization failed: {s}", .{@errorName(err)});
     };
+    log.print(.info, "Memory ready: {} MiB managed, {} MiB heap", .{ memory.physical.total_count / 256, memory.heap_size / (1024 * 1024) });
     apic.init(topology) catch |err| {
         cs.k_console.panic("APIC initialization failed: {s}", .{@errorName(err)});
     };
+    log.write(.info, "APIC interrupt routing ready");
     keyboard.init() catch |err| {
         cs.k_console.panic("PS/2 keyboard initialization failed: {s}", .{@errorName(err)});
     };
+    log.write(.info, "PS/2 keyboard ready");
     timer.init() catch |err| {
         cs.k_console.panic("Timer initialization failed: {s}", .{@errorName(err)});
     };
@@ -194,6 +201,7 @@ pub fn main() uefi.Status {
     _ = executor.spawnNamed("consumer", &message_demo, messages.Demo.consume, messages.Demo.consumerCleanup) catch |err| {
         cs.k_console.panic("Consumer spawn failed: {s}", .{@errorName(err)});
     };
+    log.print(.info, "Timer ready: {} ms/tick; shell and background tasks started", .{timer.tick_ms});
     executor.run();
     interrupts.disable();
     halt();

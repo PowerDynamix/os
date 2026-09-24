@@ -6,6 +6,17 @@ const irq = @import("interrputs.zig");
 const std = @import("std");
 const task = @import("task.zig");
 
+/// Non-ASCII navigation tokens in the byte queue; other values are ASCII.
+pub const Key = struct {
+    pub const left: u8 = 0x80;
+    pub const right: u8 = 0x81;
+    pub const up: u8 = 0x82;
+    pub const down: u8 = 0x83;
+    pub const home: u8 = 0x84;
+    pub const end: u8 = 0x85;
+    pub const delete: u8 = 0x86;
+};
+
 /// Stateful decoder also exercised independently of hardware by tests.
 pub const Decoder = struct {
     left_shift: bool = false,
@@ -36,10 +47,20 @@ pub const Decoder = struct {
         const released = byte & 0x80 != 0;
         const code = byte & 0x7f;
         if (extended) {
-            // Ignore navigation and Print Screen's synthetic shift bytes.
+            // Ignore Print Screen's synthetic shift bytes.
             if (code == 0x1d) self.right_ctrl = !released;
             if (!released and code == 0x1c) return '\n';
             if (!released and code == 0x35) return '/';
+            if (!released) return switch (code) {
+                0x4b => Key.left,
+                0x4d => Key.right,
+                0x48 => Key.up,
+                0x50 => Key.down,
+                0x47 => Key.home,
+                0x4f => Key.end,
+                0x53 => Key.delete,
+                else => null,
+            };
             return null;
         }
         switch (code) {

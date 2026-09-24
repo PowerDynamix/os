@@ -56,6 +56,12 @@ fn decoderTests() void {
     for ([_]u8{ 0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5 }) |b| check(d.feed(b) == null, "Pause generated text\n");
     check(d.feed(0x30) == 'B', "Pause poisoned decoder\n");
     check(d.feed(0x1c) == '\n' and d.feed(0x0e) == 8, "Enter/backspace\n");
+    const scans = [_]u8{ 0x4b, 0x4d, 0x48, 0x50, 0x47, 0x4f, 0x53 };
+    const keys = [_]u8{ keyboard.Key.left, keyboard.Key.right, keyboard.Key.up, keyboard.Key.down, keyboard.Key.home, keyboard.Key.end, keyboard.Key.delete };
+    for (scans, keys) |scan, key| {
+        check(d.feed(0xe0) == null and d.feed(scan) == key, "Navigation make\n");
+        check(d.feed(0xe0) == null and d.feed(scan | 0x80) == null, "Navigation break\n");
+    }
     serial.writeString("Decoder checks passed\n");
 }
 fn clobberRegisters() void {

@@ -135,6 +135,13 @@ pub const Console = struct {
         self.cursor_y = 0;
     }
 
+    /// Draw a steady underline at the insertion point without advancing it.
+    /// The shell clears/redraws the row to remove the previous cursor.
+    pub fn drawCursor(self: *Console) void {
+        const y = self.cursor_y + self.font.height - 1;
+        for (0..self.font.width) |x| self.fb.putPixel(self.cursor_x + @as(u32, @intCast(x)), y, self.fg_color);
+    }
+
     /// Erase the current text row without affecting output above it.
     pub fn clearLine(self: *Console) void {
         const end = @min(self.fb.height, self.cursor_y + self.font.height);
@@ -175,6 +182,7 @@ pub const Console = struct {
     }
 
     pub fn panic(self: *Console, comptime fmt: []const u8, args: anytype) noreturn {
+        @import("log.zig").print(.err, fmt, args);
         self.print("\n\nKERNEL PANIC!\n", .{});
         self.print("-----------------------------\n", .{});
 

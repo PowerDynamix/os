@@ -11,6 +11,7 @@ pub const Stress = struct {
     slots: [32]?[]align(64) u8 = @splat(null),
     state: u32 = 0x12345678,
     iterations: usize = 0,
+    target_rounds: usize = rounds,
     draining: usize = 0,
     done: bool = false,
 
@@ -32,7 +33,7 @@ pub const Stress = struct {
     pub fn step(self: *Stress) !bool {
         if (self.done) return true;
         const allocator = self.heap.allocator();
-        if (self.iterations < rounds) {
+        if (self.iterations < self.target_rounds) {
             self.state = self.state *% 1664525 +% 1013904223;
             const index = (self.state >> 16) % self.slots.len;
             const len = 1 + ((self.state >> 8) % 4096);

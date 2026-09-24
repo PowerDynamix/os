@@ -66,7 +66,7 @@ pub const Keyboard = struct {
             cs.k_console.print("Keyboard task stopped: {s}\n", .{@errorName(err)});
             return .complete;
         } orelse return .pending;
-        if (ch >= 32 or ch == '\n' or ch == '\t' or ch == '\x08') {
+        if ((ch >= 32 and ch < 127) or ch == '\n' or ch == '\t' or ch == '\x08') {
             cs.k_console.putChar(ch);
             self.characters += 1;
         }

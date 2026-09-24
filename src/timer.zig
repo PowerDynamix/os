@@ -37,6 +37,14 @@ pub fn countsPerTick() u32 {
     return calibrated_count;
 }
 
+/// Logging may run before timer initialization; null denotes early boot.
+pub fn nowIfInitialized() ?Instant {
+    const enabled = irq.enabled();
+    irq.disable();
+    defer restore(enabled);
+    return if (initialized) milliseconds else null;
+}
+
 pub fn now() Instant {
     const enabled = irq.enabled();
     irq.disable();
